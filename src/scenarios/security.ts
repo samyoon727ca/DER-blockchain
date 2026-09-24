@@ -210,8 +210,9 @@ export const SCENARIOS: ScenarioHook[] = [
       const buyerId = "C3";
       const buyer = ctx.participants.get(buyerId)!;
       const listing = ctx.book.listings().find((l) => l.remainingWh >= 200n);
+      const threat = "A seller watches the mempool and raises the price before a pending buy is mined.";
       if (!listing) {
-        return { at: t, title: "Front-running", threat: "", steps: [{ action: "No open listing to target", result: "skipped", blocked: true }] };
+        return { at: t, title: "Front-running", threat, steps: [{ action: "No open listing to target", result: "skipped", blocked: true }] };
       }
       const seller = [...ctx.participants.entries()].find(([, p]) => p.wallet.address === listing.seller)!;
       const amountWh = listing.remainingWh < 500n ? listing.remainingWh : 500n;
@@ -250,7 +251,7 @@ export const SCENARIOS: ScenarioHook[] = [
       return {
         at: t,
         title: "Front-running",
-        threat: "A seller watches the mempool and raises the price before a pending buy is mined.",
+        threat,
         steps: [
           {
             action: `${buyerId} submits buy of ${Number(amountWh) / 1000} kWh from listing #${listing.id} at $${formatUsd(listing.pricePerKwh, 3)}/kWh (tip 1 gwei)`,
