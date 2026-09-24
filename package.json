@@ -13,8 +13,6 @@
     "typecheck": "hardhat compile --quiet && tsc --noEmit",
     "demo": "hardhat compile --quiet && ts-node scripts/demo.ts",
     "demo:fast": "hardhat compile --quiet && ts-node scripts/demo.ts --fast --exit",
-    "node": "hardhat node",
-    "deploy": "hardhat compile --quiet && ts-node scripts/deploy.ts",
     "report": "ts-node scripts/report.ts"
   },
   "devDependencies": {
