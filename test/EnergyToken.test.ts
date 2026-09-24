@@ -159,7 +159,10 @@ describe("EnergyToken", () => {
 
     it("has no mint function other than submitReading", async () => {
       const { token } = await loadFixture(deployFixture);
-      expect(token.interface.getFunction("mint")).to.be.null;
+      const functions: string[] = [];
+      token.interface.forEachFunction((f) => functions.push(f.name));
+      expect(functions.filter((name) => /mint/i.test(name))).to.deep.equal([]);
+      expect(functions).to.include("submitReading");
     });
 
     it("stops a revoked oracle from minting", async () => {

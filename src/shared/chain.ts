@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { JsonRpcProvider, type Signer } from "ethers";
+import { JsonRpcProvider, type ContractRunner, type Interface } from "ethers";
 import {
   EnergyMarketplace__factory,
   EnergyToken__factory,
@@ -46,12 +46,20 @@ export interface Contracts {
 }
 
 export function rpcProvider(rpcUrl: string): JsonRpcProvider {
-  // staticNetwork skips a chainId round-trip on every call; the fast polling
-  // interval suits an automining local chain.
-  return new JsonRpcProvider(rpcUrl, HARDHAT_CHAIN_ID, { staticNetwork: true, pollingInterval: 100 });
+  // Tuned for an automining local chain:
+  //  - staticNetwork skips a chainId round-trip on every call;
+  //  - cacheTimeout -1 disables ethers' 250 ms response cache, which would
+  //    otherwise hand out stale nonces when a wallet sends transactions back to back;
+  //  - batchMaxCount 1 sends each request immediately instead of waiting to batch.
+  return new JsonRpcProvider(rpcUrl, HARDHAT_CHAIN_ID, {
+    staticNetwork: true,
+    pollingInterval: 100,
+    cacheTimeout: -1,
+    batchMaxCount: 1,
+  });
 }
 
-export function connectContracts(d: Deployment, runner: Signer | JsonRpcProvider): Contracts {
+export function connectContracts(d: Deployment, runner: ContractRunner): Contracts {
   return {
     token: EnergyToken__factory.connect(d.contracts.energyToken, runner),
     market: EnergyMarketplace__factory.connect(d.contracts.marketplace, runner),
@@ -71,8 +79,35 @@ export function loadDeployment(): Deployment {
   return JSON.parse(fs.readFileSync(DEPLOYMENT_FILE, "utf8")) as Deployment;
 }
 
-/** Decoded custom-error name from an ethers contract error, e.g. "StaleNonce". */
-export function revertName(err: unknown): string {
-  const e = err as { revert?: { name?: string }; shortMessage?: string; message?: string };
-  return e.revert?.name ?? e.shortMessage ?? e.message ?? String(err);
+interface EthersError {
+  code?: string;
+  data?: unknown;
+  revert?: { name?: string };
+  shortMessage?: string;
+  message?: string;
+}
+
+/**
+ * Custom-error name of a contract revert, e.g. "StaleNonce". Works for errors
+ * from a JSON-RPC provider (decoded by ethers) and from Hardhat's in-process
+ * provider (raw revert data, decoded here with `iface`).
+ */
+export function revertName(err: unknown, iface?: Interface): string {
+  const e = err as EthersError;
+  if (e.revert?.name) return e.revert.name;
+  if (iface && typeof e.data === "string") {
+    try {
+      const parsed = iface.parseError(e.data);
+      if (parsed) return parsed.name;
+    } catch {
+      // not one of this contract's errors
+    }
+  }
+  return e.shortMessage ?? e.message ?? String(err);
+}
+
+/** True if the error is a contract revert (as opposed to e.g. a network failure). */
+export function isRevert(err: unknown): boolean {
+  const e = err as EthersError;
+  return e.code === "CALL_EXCEPTION" || (typeof e.data === "string" && e.data.startsWith("0x"));
 }
