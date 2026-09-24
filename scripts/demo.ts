@@ -15,6 +15,7 @@
  */
 import fs from "node:fs";
 import type http from "node:http";
+import net from "node:net";
 import { ConsumerAgent, OrderBook, ProsumerAgent, type MarketEvent } from "../src/market/agents";
 import { sendToOracle } from "../src/meter-simulator/meter";
 import type { IntervalFlows } from "../src/meter-simulator/physics";
@@ -68,6 +69,22 @@ const demo = {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** An expected, user-fixable problem: printed without a stack trace. */
+class DemoError extends Error {}
+
+/** Fail fast with a clear message if a port is taken (e.g. a previous demo is still running). */
+async function assertPortsFree(ports: [envVar: string, port: number][]): Promise<void> {
+  for (const [envVar, port] of ports) {
+    await new Promise<void>((resolve, reject) => {
+      const probe = net.createServer();
+      probe.once("error", () =>
+        reject(new DemoError(`Port ${port} is already in use (is another demo still running?). Stop it or set ${envVar} to a free port.`)),
+      );
+      probe.listen(port, "127.0.0.1", () => probe.close(() => resolve()));
+    });
+  }
+}
+
 async function startChain(dayStart: number): Promise<{ close(): Promise<void> }> {
   // The chain clock has to start before the simulated day (it can only move forward).
   process.env.SIM_GENESIS_DATE = new Date((dayStart - 86_400) * 1000).toISOString();
@@ -104,7 +121,12 @@ function closeServer(server: { close(cb?: () => void): unknown } | undefined): P
 }
 
 async function main() {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(SIM_DATE)) throw new Error(`SIM_DATE must be YYYY-MM-DD, got "${SIM_DATE}"`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(SIM_DATE)) throw new DemoError(`SIM_DATE must be YYYY-MM-DD, got "${SIM_DATE}"`);
+  await assertPortsFree([
+    ["RPC_PORT", RPC_PORT],
+    ["ORACLE_PORT", ORACLE_PORT],
+    ["DASHBOARD_PORT", DASHBOARD_PORT],
+  ]);
   const dayStart = Date.parse(`${SIM_DATE}T00:00:00Z`) / 1000;
   demo.dayStart = dayStart;
 
@@ -112,9 +134,7 @@ async function main() {
   console.log(dim(`Simulated day ${SIM_DATE} (UTC clock) · 5 prosumers + 5 consumers · 96 × 15-minute intervals\n`));
 
   // 1. Local chain ----------------------------------------------------------
-  const chain = await startChain(dayStart).catch((err) => {
-    throw new Error(`Could not start the local chain on port ${RPC_PORT} (${err.message}). Set RPC_PORT to use another port.`);
-  });
+  const chain = await startChain(dayStart);
   const rpcUrl = `http://127.0.0.1:${RPC_PORT}`;
   const provider = rpcProvider(rpcUrl);
 
@@ -300,6 +320,7 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(red(`\nDemo failed: ${err instanceof Error ? err.stack ?? err.message : err}`));
+  const detail = err instanceof DemoError ? err.message : err instanceof Error ? err.stack ?? err.message : String(err);
+  console.error(red(`\nDemo failed: ${detail}`));
   process.exit(1);
 });
