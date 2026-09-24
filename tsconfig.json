@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "lib": ["es2022"],
+    "strict": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "types": ["node", "mocha", "chai"]
+  },
+  "ts-node": {
+    "transpileOnly": true
+  },
+  "include": ["hardhat.config.ts", "scripts", "src", "test", "typechain-types"]
+}
