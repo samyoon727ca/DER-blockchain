@@ -52,6 +52,8 @@ export interface OracleOptions {
 export class Oracle {
   readonly stats = { received: 0, settled: 0, queued: 0, rejected: 0 };
   readonly log: OracleLogEntry[] = [];
+  /** Rejections are rare and interesting, so they are kept separately from the rolling log. */
+  readonly rejections: OracleLogEntry[] = [];
   private readonly cursors = new Map<string, MeterCursor>();
   private readonly seenDigests = new Set<string>();
   private readonly queue: QueuedReading[] = [];
@@ -165,6 +167,7 @@ export class Oracle {
     return {
       stats: { ...this.stats },
       recent: this.log.slice(-200),
+      rejections: this.rejections,
     };
   }
 
@@ -190,13 +193,20 @@ export class Oracle {
     this.log.push(entry);
     if (this.log.length > this.logSize) this.log.splice(0, this.log.length - this.logSize);
     this.stats[entry.status]++;
+    if (entry.status === "rejected") this.keepRejection(entry);
     return this.publicResult(entry);
+  }
+
+  private keepRejection(entry: OracleLogEntry): void {
+    this.rejections.push(entry);
+    if (this.rejections.length > 100) this.rejections.shift();
   }
 
   private transition(entry: OracleLogEntry, update: OracleResult): void {
     this.stats[entry.status]--;
     Object.assign(entry, update);
     this.stats[entry.status]++;
+    if (entry.status === "rejected") this.keepRejection(entry);
   }
 
   private publicResult(e: OracleLogEntry): OracleResult {

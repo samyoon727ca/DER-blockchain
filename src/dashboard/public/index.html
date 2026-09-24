@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Energy Marketplace Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="viz-root">
+      <header class="page-header">
+        <div>
+          <h1>Neighbourhood energy marketplace</h1>
+          <p class="subtitle">Live view of a local Hardhat chain · proof of concept, no real funds</p>
+        </div>
+        <div class="clock">
+          <div class="clock-row">
+            <span class="clock-time" id="sim-time">--:--</span>
+            <span class="muted" id="sim-date"></span>
+          </div>
+          <div class="meter" role="progressbar" aria-label="Simulated day progress" aria-valuemin="0" aria-valuemax="100" id="day-meter">
+            <div class="meter-fill" id="day-meter-fill"></div>
+          </div>
+          <div class="chips">
+            <span class="chip" id="chip-phase">Connecting…</span>
+            <span class="chip" id="chip-token">Token: –</span>
+            <span class="chip muted" id="chip-block">Block –</span>
+          </div>
+        </div>
+      </header>
+
+      <section class="kpis" aria-label="Headline figures">
+        <div class="tile"><div class="tile-label">Credits minted (verified export)</div><div class="tile-value" id="kpi-minted">–</div><div class="tile-sub" id="kpi-minted-sub"></div></div>
+        <div class="tile"><div class="tile-label">Traded peer-to-peer</div><div class="tile-value" id="kpi-traded">–</div><div class="tile-sub" id="kpi-traded-sub"></div></div>
+        <div class="tile"><div class="tile-label">Consumed from credits (burned)</div><div class="tile-value" id="kpi-burned">–</div><div class="tile-sub" id="kpi-burned-sub"></div></div>
+        <div class="tile"><div class="tile-label">Average P2P price</div><div class="tile-value" id="kpi-price">–</div><div class="tile-sub" id="kpi-price-sub"></div></div>
+        <div class="tile"><div class="tile-label">Oracle decisions</div><div class="tile-value" id="kpi-oracle">–</div><div class="tile-sub" id="kpi-oracle-sub"></div></div>
+      </section>
+
+      <section class="grid two">
+        <article class="card">
+          <h2>Neighbourhood energy per 15-minute interval</h2>
+          <p class="card-sub">Verified meter readings settled on-chain, all 10 meters combined (kWh)</p>
+          <div class="legend" id="flow-legend"></div>
+          <div class="chart" id="flow-chart"></div>
+        </article>
+        <article class="card">
+          <h2>Income per prosumer</h2>
+          <p class="card-sub">Peer-to-peer sales in mock USD, from Trade events</p>
+          <div class="chart" id="income-chart"></div>
+        </article>
+      </section>
+
+      <section class="card">
+        <h2>Meter readings</h2>
+        <p class="card-sub">Latest settled interval per meter. PV, load and battery are simulator telemetry (behind the meter); export and import are the signed, on-chain values.</p>
+        <div class="table-wrap"><table id="meters-table"></table></div>
+      </section>
+
+      <section class="card">
+        <h2>Balances</h2>
+        <p class="card-sub">Energy credits (EKWH, 1 token = 1 kWh) and mock stablecoin per participant</p>
+        <div class="table-wrap"><table id="balances-table"></table></div>
+      </section>
+
+      <section class="grid two">
+        <article class="card">
+          <h2>Open listings</h2>
+          <p class="card-sub" id="listings-sub">Credits in marketplace escrow</p>
+          <div class="table-wrap scroll"><table id="listings-table"></table></div>
+        </article>
+        <article class="card">
+          <h2>Trade history</h2>
+          <p class="card-sub" id="trades-sub">Most recent first</p>
+          <div class="table-wrap scroll"><table id="trades-table"></table></div>
+        </article>
+      </section>
+
+      <section class="grid two">
+        <article class="card">
+          <h2>Security scenarios</h2>
+          <p class="card-sub">Attacks and failures injected during the simulated day</p>
+          <div id="scenarios"></div>
+        </article>
+        <article class="card">
+          <h2>Oracle feed</h2>
+          <p class="card-sub">Rejected readings (all of them), then the latest decisions</p>
+          <div class="table-wrap"><table id="rejections-table"></table></div>
+          <h3 class="table-title">Latest decisions</h3>
+          <div class="table-wrap scroll"><table id="oracle-table"></table></div>
+        </article>
+      </section>
+
+      <footer class="muted small">Data: JSON-RPC to the local chain (read-only proxy), oracle status API, simulator telemetry. Refreshes every 1.5 s.</footer>
+    </main>
+    <div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+    <script src="/vendor/ethers.umd.min.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

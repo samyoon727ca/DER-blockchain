@@ -3,6 +3,10 @@ import "@nomicfoundation/hardhat-ethers";
 import "@nomicfoundation/hardhat-chai-matchers";
 import "@typechain/hardhat";
 
+// `npm run demo` should never stop to ask an interactive question. Hardhat's
+// first-run telemetry prompt is skipped (no consent recorded = nothing sent).
+process.env.HARDHAT_DISABLE_TELEMETRY_PROMPT ??= "true";
+
 const config: HardhatUserConfig = {
   solidity: {
     version: "0.8.28",
