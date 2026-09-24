@@ -5,7 +5,7 @@
   "description": "Proof of concept: tokenized distributed-energy credits and a peer-to-peer energy marketplace on a local Hardhat chain.",
   "license": "MIT",
   "engines": {
-    "node": ">=18.18"
+    "node": ">=20"
   },
   "scripts": {
     "compile": "hardhat compile",

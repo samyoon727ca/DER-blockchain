@@ -30,7 +30,7 @@ These choices shape the whole PoC. Anything not listed here is covered under [Kn
 
 ## Quick start
 
-**Requirements:** Node.js 18.18 or newer (developed and tested with Node 22) and npm. The first compile downloads the Solidity 0.8.28 compiler, so it needs internet access once.
+**Requirements:** Node.js 20 or newer (developed and tested with Node 22) and npm. The first compile downloads the Solidity 0.8.28 compiler, so it needs internet access once.
 
 ```bash
 npm install
