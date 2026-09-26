@@ -34,11 +34,22 @@ import { startDashboard } from "../src/dashboard/server";
 const args = new Set(process.argv.slice(2));
 const FAST = args.has("--fast");
 const EXIT_WHEN_DONE = args.has("--exit");
-const INTERVAL_DELAY_MS = FAST ? 0 : Number(process.env.DEMO_INTERVAL_MS ?? 350);
+/** Problems with the environment, reported by main() as one clear error. */
+const envErrors: string[] = [];
+function envInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (Number.isInteger(value) && value >= min && value <= max) return value;
+  envErrors.push(`${name} must be an integer from ${min} to ${max}, got "${raw}"`);
+  return fallback;
+}
+
+const INTERVAL_DELAY_MS = FAST ? 0 : envInt("DEMO_INTERVAL_MS", 350, 0, 60_000);
 const SIM_DATE = process.env.SIM_DATE ?? "2026-06-21";
-const RPC_PORT = Number(process.env.RPC_PORT ?? 8545);
-const ORACLE_PORT = Number(process.env.ORACLE_PORT ?? 8600);
-const DASHBOARD_PORT = Number(process.env.DASHBOARD_PORT ?? 3000);
+const RPC_PORT = envInt("RPC_PORT", 8545, 1, 65_535);
+const ORACLE_PORT = envInt("ORACLE_PORT", 8600, 1, 65_535);
+const DASHBOARD_PORT = envInt("DASHBOARD_PORT", 3000, 1, 65_535);
 
 const tty = process.stdout.isTTY;
 const color = (code: number) => (s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -79,6 +90,9 @@ class DemoError extends Error {}
 
 /** Fail fast with a clear message if a port is taken (e.g. a previous demo is still running). */
 async function assertPortsFree(ports: [envVar: string, port: number][]): Promise<void> {
+  // Each probe closes before the next, so two services set to one port would both pass.
+  const clash = ports.find(([, port], i) => ports.findIndex(([, other]) => other === port) !== i);
+  if (clash) throw new DemoError(`${ports.map(([name]) => name).join(", ")} must all differ; ${clash[1]} is used twice.`);
   for (const [envVar, port] of ports) {
     await new Promise<void>((resolve, reject) => {
       const probe = net.createServer();
@@ -126,6 +140,7 @@ function closeServer(server: { close(cb?: () => void): unknown } | undefined): P
 }
 
 async function main() {
+  if (envErrors.length > 0) throw new DemoError(envErrors.join("\n"));
   // Date.parse rolls impossible dates over (2026-02-30 -> March 2), so round-trip to be sure.
   const dayStart = Date.parse(`${SIM_DATE}T00:00:00Z`) / 1000;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(SIM_DATE) || !Number.isFinite(dayStart) || new Date(dayStart * 1000).toISOString().slice(0, 10) !== SIM_DATE) {
