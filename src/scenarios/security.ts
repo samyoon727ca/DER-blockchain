@@ -285,10 +285,25 @@ export const SCENARIOS: ScenarioHook[] = [
         .then(() => "none")
         .catch((err) => revertName(err, buyer.contracts.market.interface));
       const cashAfter = await buyer.contracts.stable.balanceOf(buyer.wallet.address);
+      const paid = `buyer paid $${formatUsd(cashBefore - cashAfter)}`;
+      const outcome =
+        buyReceipt === null
+          ? "the buy was not mined"
+          : buyReceipt.status === 1
+            ? orderedFirst
+              ? `FILLED at the higher price; ${paid} — this should not happen`
+              : `filled before the price change; ${paid}`
+            : reason === "PriceAboveLimit"
+              ? `reverted (${reason}); ${paid} — maxPricePerKwh protected the order`
+              : `reverted (${reason}), not because of maxPricePerKwh; ${paid}`;
 
-      // Put the market back as it was, so the attack does not distort the rest of the day.
-      if (setup.length > 0) await (await sellerMarket.cancelListing(target.id)).wait();
-      else await (await sellerMarket.updatePrice(target.id, target.pricePerKwh)).wait();
+      // Put the market back as it was, so the attack does not distort the rest of the day
+      // (unless the buy emptied the listing, which the steps below report as a failure).
+      const live = await sellerMarket.getListing(target.id);
+      if (live.active && setup.length > 0) await (await sellerMarket.cancelListing(target.id)).wait();
+      else if (live.active && live.pricePerKwh !== target.pricePerKwh) {
+        await (await sellerMarket.updatePrice(target.id, target.pricePerKwh)).wait();
+      }
 
       return {
         at: t,
@@ -308,10 +323,7 @@ export const SCENARIOS: ScenarioHook[] = [
           },
           {
             action: `${buyerId}'s buy executes after the price change`,
-            result:
-              buyReceipt?.status === 0
-                ? `reverted (${reason}); buyer paid $${formatUsd(cashBefore - cashAfter)} — maxPricePerKwh protected the order`
-                : "FILLED at the higher price — this should not happen",
+            result: outcome,
             blocked: orderedFirst && buyReceipt?.status === 0 && reason === "PriceAboveLimit" && cashAfter === cashBefore,
           },
         ],
