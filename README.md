@@ -43,7 +43,7 @@ npm run demo
 |---|---|
 | `npm run demo` | Full paced demo; keeps running at the end so you can explore the dashboard |
 | `npm run demo:fast` | Same simulation with no pacing (about a minute); exits with code 0 only if every integrity check passed and every security scenario ran and was handled safely |
-| `npm test` | Unit tests for the contracts, oracle, settlement report and dashboard proxy (87 tests) |
+| `npm test` | Unit tests for the contracts, oracle, settlement report and dashboard proxy (88 tests) |
 | `npm run report` | Rebuild the settlement report from the running chain (run in a second terminal while the demo is up); exits with code 1 if an integrity check fails |
 | `npm run typecheck` | TypeScript type check of everything |
 | `npm run compile` | Compile contracts and generate TypeChain types |
@@ -285,9 +285,9 @@ The browser talks to the chain through a proxy that only forwards read-only JSON
 npm test
 ```
 
-87 tests in five files:
+88 tests in five files:
 
-- `test/EnergyToken.test.ts`: metadata; role setup; meter registry (registrar-only, no re-registration, suspend and reinstate); minting (oracle-only, no other mint path, revoked oracle, capacity limits); signatures (wrong key, tampered fields, cross-contract replay, malformed, unregistered meter, digest parity with off-chain code); replay and double counting (exact replay, same interval with a new nonce, older interval, stale nonce, nonce gaps, unfinished and misaligned intervals); consumption burn (partial, capped at balance, none, netting); pause (mint, burn and transfers); role administration.
+- `test/EnergyToken.test.ts`: metadata; role setup; meter registry (registrar-only, no re-registration, suspend and reinstate); minting (oracle-only, no other mint path, revoked oracle, capacity limits); signatures (wrong key, tampered fields, cross-contract and cross-chain replay, malformed, unregistered meter, digest parity with off-chain code); replay and double counting (exact replay, same interval with a new nonce, older interval, stale nonce, nonce gaps, unfinished and misaligned intervals); consumption burn (partial, capped at balance, none, netting); pause (mint, burn and transfers); role administration.
 - `test/EnergyMarketplace.test.ts`: escrow on listing; zero checks; no double selling; approvals; full and partial fills; rounding; over-buying; self-trade; unknown listing; unpayable buys; front-running protection; re-pricing permissions; cancellation; burn of purchased credits; escrow not burnable; marketplace pause (cancel still allowed); token pause halting trades and freezing escrow until unpause; access control.
 - `test/Oracle.test.ts`: every validation rule on its own, including signature encodings the contract would refuse; the service against a local chain (settle, reject replay, queue while paused and drain in order, parity with the contract on signature encodings, forgetting a reading the chain refused, reconciling a lost confirmation, cursor after a restart); the HTTP server's 16 KB body cap.
 - `test/Settlement.test.ts`: the report on a small traded history (figures and integrity checks), reading at one block while more readings settle mid-report, signature re-verification from calldata (including uint64 nonces beyond JavaScript's safe integers), credits held outside the demo's wallets, and stablecoin issued after funding.

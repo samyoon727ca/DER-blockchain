@@ -237,6 +237,17 @@ describe("EnergyToken", () => {
       );
     });
 
+    it("rejects a signature made for the same contract address on another chain (cross-chain replay)", async () => {
+      const { token, oracle, prosumerMeter, t0 } = await loadFixture(deployFixture);
+      const otherChain = readingDomain(1, await token.getAddress());
+      const reading = { meter: prosumerMeter.address, intervalStart: t0, exportedWh: 100, importedWh: 0, nonce: 1 };
+      const signature = await signReading(prosumerMeter.wallet, otherChain, reading);
+      await expect(token.connect(oracle).submitReading(reading, signature)).to.be.revertedWithCustomError(
+        token,
+        "InvalidMeterSignature",
+      );
+    });
+
     it("rejects malformed signatures", async () => {
       const { token, oracle, prosumerMeter, t0 } = await loadFixture(deployFixture);
       const { reading } = await prosumerMeter.sign({ intervalStart: t0, exportedWh: 100 });

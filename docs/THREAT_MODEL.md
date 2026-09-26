@@ -132,7 +132,7 @@ The key design decision is **defence in depth at trust boundary 2**: `EnergyToke
 - `ReentrancyGuard` and checks-effects-interactions on every marketplace function that moves tokens; `SafeERC20` for transfers.
 - No loops anywhere in the contracts: every function does constant work, so no call can run out of gas as state grows. Open listings are enumerated off-chain from events.
 - Cost rounding is up (`Math.mulDiv(..., Ceil)`), so dust purchases are never free.
-- 87 unit tests covering minting rules, trades, access control, pause, replay, the oracle, the settlement report's integrity checks and the dashboard proxy.
+- 88 unit tests covering minting rules, trades, access control, pause, replay, the oracle, the settlement report's integrity checks and the dashboard proxy.
 
 **Deferred.** Independent audit, fuzzing / invariant tests (e.g. supply = minted − burned under random operations), formal verification of the reading checks.
 

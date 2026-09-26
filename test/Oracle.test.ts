@@ -10,14 +10,21 @@ import { parseSignedReading, validateReading, type ValidationContext } from "../
 import { INTERVAL_SECONDS, readingDomain, signReading, type SignedReading } from "../src/shared/reading";
 import { MAX_EXPORT_WH, MAX_IMPORT_WH, TestMeter, domainFor, lastFinishedInterval } from "./helpers";
 
-/** The same signature in encodings ethers accepts but OpenZeppelin's ECDSA (and so EnergyToken) refuses. */
+const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+
+/**
+ * The same signature in encodings OpenZeppelin's ECDSA (and so EnergyToken) refuses: the
+ * first three are ones ethers accepts; the last is the malleable twin (s -> n - s, v flipped).
+ */
 function nonCanonical(signature: string): Record<string, string> {
   const sig = Signature.from(signature);
   const rs = sig.r + sig.s.slice(2);
+  const highS = (SECP256K1_N - BigInt(sig.s)).toString(16).padStart(64, "0");
   return {
     "64-byte compact (EIP-2098)": sig.compactSerialized,
     "v = 0/1": rs + (sig.v - 27).toString(16).padStart(2, "0"),
     "v = 35/36 (EIP-155 style)": rs + (sig.v - 27 + 35).toString(16),
+    "high s (malleated)": sig.r + highS + (sig.v === 27 ? "1c" : "1b"),
   };
 }
 
@@ -72,7 +79,7 @@ describe("Oracle", () => {
       expect(await codeFor({ reading, signature: "0x1234" })).to.equal("BAD_SIGNATURE");
     });
 
-    it("rejects signature encodings the contract would refuse (compact, v = 0/1, EIP-155 v)", async () => {
+    it("rejects signature encodings the contract would refuse (compact, v = 0/1, EIP-155 v, high s)", async () => {
       const signed = await meter.sign({ intervalStart: T, exportedWh: 900 });
       for (const [form, signature] of Object.entries(nonCanonical(signed.signature))) {
         expect(await codeFor({ reading: signed.reading, signature }), form).to.equal("BAD_SIGNATURE");
