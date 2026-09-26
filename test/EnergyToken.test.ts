@@ -237,6 +237,17 @@ describe("EnergyToken", () => {
       );
     });
 
+    it("rejects a signature made for the same contract address on another chain (cross-chain replay)", async () => {
+      const { token, oracle, prosumerMeter, t0 } = await loadFixture(deployFixture);
+      const otherChain = readingDomain(1, await token.getAddress());
+      const reading = { meter: prosumerMeter.address, intervalStart: t0, exportedWh: 100, importedWh: 0, nonce: 1 };
+      const signature = await signReading(prosumerMeter.wallet, otherChain, reading);
+      await expect(token.connect(oracle).submitReading(reading, signature)).to.be.revertedWithCustomError(
+        token,
+        "InvalidMeterSignature",
+      );
+    });
+
     it("rejects malformed signatures", async () => {
       const { token, oracle, prosumerMeter, t0 } = await loadFixture(deployFixture);
       const { reading } = await prosumerMeter.sign({ intervalStart: t0, exportedWh: 100 });
@@ -390,18 +401,25 @@ describe("EnergyToken", () => {
       await token.connect(oracle).submitReading(first.reading, first.signature);
 
       await expect(token.connect(admin).pause()).to.emit(token, "Paused");
-      const { reading, signature } = await prosumerMeter.sign({ intervalStart: t0, exportedWh: 100 });
-      await expect(token.connect(oracle).submitReading(reading, signature)).to.be.revertedWithCustomError(
-        token,
-        "EnforcedPause",
-      );
+      // An export reading would mint and an import reading would burn: neither may settle while paused.
+      const exporting = await prosumerMeter.sign({ intervalStart: t0, exportedWh: 100 });
+      const importing = await prosumerMeter.sign({ intervalStart: t0, importedWh: 60 });
+      for (const { reading, signature } of [exporting, importing]) {
+        await expect(token.connect(oracle).submitReading(reading, signature)).to.be.revertedWithCustomError(
+          token,
+          "EnforcedPause",
+        );
+      }
+      expect(await token.balanceOf(prosumer.address)).to.equal(100);
       await expect(token.connect(prosumer).transfer(consumer.address, 1)).to.be.revertedWithCustomError(
         token,
         "EnforcedPause",
       );
 
       await token.connect(admin).unpause();
-      await expect(token.connect(oracle).submitReading(reading, signature)).to.emit(token, "CreditsMinted");
+      await expect(token.connect(oracle).submitReading(importing.reading, importing.signature))
+        .to.emit(token, "CreditsBurned")
+        .withArgs(prosumer.address, prosumerMeter.address, t0, 60);
       await expect(token.connect(prosumer).transfer(consumer.address, 1)).not.to.be.reverted;
     });
 

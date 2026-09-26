@@ -37,9 +37,8 @@ export async function deployMarketplace(opts: DeployOptions): Promise<Deployment
   for (const { spec, wallet } of opts.participants) {
     const meter = meterKey(spec.id).address;
     await (await token.registerMeter(meter, wallet, maxExportWh(spec), maxImportWh(spec))).wait();
-    if (spec.role === "consumer") {
-      await (await stable.mint(wallet, BigInt(CONSUMER_STARTING_USD) * USD)).wait();
-    }
+    const startingUsd = spec.role === "consumer" ? CONSUMER_STARTING_USD : 0;
+    if (startingUsd > 0) await (await stable.mint(wallet, BigInt(startingUsd) * USD)).wait();
     records.push({
       id: spec.id,
       role: spec.role,
@@ -50,6 +49,7 @@ export async function deployMarketplace(opts: DeployOptions): Promise<Deployment
       batteryKwh: spec.battery?.capacityKwh ?? 0,
       maxExportWh: maxExportWh(spec),
       maxImportWh: maxImportWh(spec),
+      startingUsd,
     });
   }
 

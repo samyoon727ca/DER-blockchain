@@ -39,7 +39,7 @@ export interface ValidationContext {
   maxReadingAgeSeconds: number;
   meter: MeterInfo | undefined; // registry entry for reading.meter, undefined if unregistered
   cursor: MeterCursor;
-  seenDigests: ReadonlySet<string>;
+  seenDigests: { has(digest: string): boolean }; // digests of accepted readings still inside the age window
 }
 
 export type Verdict = { ok: true; digest: string } | { ok: false; code: RejectCode; detail: string };
@@ -77,10 +77,11 @@ export function parseSignedReading(body: unknown): SignedReading | Extract<Verdi
 export function validateReading({ reading, signature }: SignedReading, ctx: ValidationContext): Verdict {
   const reject = (code: RejectCode, detail: string): Verdict => ({ ok: false, code, detail });
 
-  // 1. Authenticity: signed by the meter it claims to come from.
+  // 1. Authenticity: signed by the meter it claims to come from, in the one
+  //    encoding the contract accepts (65 bytes, v = 27/28, low s).
   const signer = recoverReadingSigner(ctx.domain, reading, signature);
   if (signer === null || signer !== reading.meter) {
-    return reject("BAD_SIGNATURE", `signature does not match meter ${reading.meter}`);
+    return reject("BAD_SIGNATURE", `signature is not a valid signature by meter ${reading.meter}`);
   }
 
   // 2. The meter must be registered and in service.

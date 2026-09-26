@@ -53,7 +53,7 @@
 
       <section class="card">
         <h2>Meter readings</h2>
-        <p class="card-sub">Latest settled interval per meter. PV, load and battery are simulator telemetry (behind the meter); export and import are the signed, on-chain values.</p>
+        <p class="card-sub">Latest settled interval per meter. PV, load and battery are simulator telemetry (behind the meter) for that interval; export and import are the signed, on-chain values. The oracle column shows each meter's most recent reading, with its interval if it has not settled yet.</p>
         <div class="table-wrap"><table id="meters-table"></table></div>
       </section>
 
@@ -84,7 +84,7 @@
         </article>
         <article class="card">
           <h2>Oracle feed</h2>
-          <p class="card-sub">Rejected readings (all of them), then the latest decisions</p>
+          <p class="card-sub">The latest 100 rejected readings, then the latest decisions</p>
           <div class="table-wrap"><table id="rejections-table"></table></div>
           <h3 class="table-title">Latest decisions</h3>
           <div class="table-wrap scroll"><table id="oracle-table"></table></div>

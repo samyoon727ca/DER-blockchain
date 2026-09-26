@@ -1,11 +1,12 @@
 import http from "node:http";
+import { BodyTooLarge, readBody } from "../shared/http";
 import type { Oracle } from "./oracle";
 
-const MAX_BODY_BYTES = 16 * 1024;
+export const MAX_BODY_BYTES = 16 * 1024;
 
 /**
  * HTTP front door for meters:
- *   POST /readings  {reading, signature} -> 200 settled | 202 queued | 422 rejected
+ *   POST /readings  {reading, signature} -> 200 settled | 202 queued | 422 rejected | 413 body over 16 KB
  *   GET  /status    counters and the most recent decisions (used by the dashboard)
  */
 export function startOracleServer(oracle: Oracle, port: number, host = "127.0.0.1"): Promise<http.Server> {
@@ -16,7 +17,7 @@ export function startOracleServer(oracle: Oracle, port: number, host = "127.0.0.
     };
     try {
       if (req.method === "POST" && req.url === "/readings") {
-        const body = await readBody(req);
+        const body = await readBody(req, MAX_BODY_BYTES);
         let json: unknown;
         try {
           json = JSON.parse(body);
@@ -30,29 +31,11 @@ export function startOracleServer(oracle: Oracle, port: number, host = "127.0.0.
       if (req.method === "GET" && req.url === "/health") return send(200, { ok: true });
       send(404, { error: "not found" });
     } catch (err) {
-      send(500, { error: (err as Error).message });
+      send(err instanceof BodyTooLarge ? 413 : 500, { error: (err as Error).message });
     }
   });
   return new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, () => resolve(server));
-  });
-}
-
-function readBody(req: http.IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
-        reject(new Error("request body too large"));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
   });
 }

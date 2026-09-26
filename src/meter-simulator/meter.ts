@@ -34,12 +34,18 @@ export interface OracleResponse {
   burnedWh?: number;
 }
 
-/** Deliver a signed reading to the oracle over HTTP, as a meter's uplink would. */
+/**
+ * Deliver a signed reading to the oracle over HTTP, as a meter's uplink would.
+ * An error response without a decision (e.g. a 500) is reported as a rejection
+ * carrying the HTTP status, rather than as a decision the oracle never made.
+ */
 export async function sendToOracle(oracleUrl: string, signed: SignedReading): Promise<OracleResponse> {
   const res = await fetch(`${oracleUrl}/readings`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(signed),
   });
-  return (await res.json()) as OracleResponse;
+  const body = (await res.json().catch(() => ({}))) as Partial<OracleResponse> & { error?: string };
+  if (body.status === "settled" || body.status === "queued" || body.status === "rejected") return body as OracleResponse;
+  return { status: "rejected", code: `HTTP_${res.status}`, detail: body.error ?? res.statusText };
 }

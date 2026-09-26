@@ -234,7 +234,7 @@ describe("EnergyMarketplace", () => {
   });
 
   describe("pause and access control", () => {
-    it("blocks listing, re-pricing and buying while paused but always lets sellers cancel", async () => {
+    it("blocks listing, re-pricing and buying while the marketplace is paused, but still lets sellers cancel", async () => {
       const { market, admin, seller, buyer, listingId } = await loadFixture(listedFixture);
       await expect(market.connect(admin).pause()).to.emit(market, "Paused");
 
@@ -251,6 +251,20 @@ describe("EnergyMarketplace", () => {
       const { market, token, admin, buyer, listingId } = await loadFixture(listedFixture);
       await token.connect(admin).pause();
       await expect(market.connect(buyer).buy(listingId, 100, PRICE)).to.be.revertedWithCustomError(token, "EnforcedPause");
+    });
+
+    it("keeps escrow in place while the energy token is paused (no credit moves), and returns it after unpause", async () => {
+      const { market, token, admin, seller, listingId } = await loadFixture(listedFixture);
+      await token.connect(admin).pause();
+      await expect(market.connect(seller).cancelListing(listingId)).to.be.revertedWithCustomError(token, "EnforcedPause");
+      const l = await market.getListing(listingId);
+      expect(l.active).to.equal(true);
+      expect(l.remainingWh).to.equal(2000n);
+
+      await token.connect(admin).unpause();
+      await expect(market.connect(seller).cancelListing(listingId))
+        .to.emit(market, "ListingCancelled")
+        .withArgs(listingId, seller.address, 2000);
     });
 
     it("only the pauser role can pause", async () => {

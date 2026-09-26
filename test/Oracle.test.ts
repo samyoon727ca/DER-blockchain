@@ -1,12 +1,32 @@
 import { expect } from "chai";
+import type { AddressInfo } from "node:net";
 import { ethers } from "hardhat";
 import { loadFixture } from "@nomicfoundation/hardhat-network-helpers";
-import { Wallet } from "ethers";
-import { EnergyToken__factory } from "../typechain-types";
+import { Signature, Wallet } from "ethers";
+import { EnergyToken__factory, type EnergyToken } from "../typechain-types";
 import { Oracle } from "../src/oracle/oracle";
+import { MAX_BODY_BYTES, startOracleServer } from "../src/oracle/server";
 import { parseSignedReading, validateReading, type ValidationContext } from "../src/oracle/validation";
 import { INTERVAL_SECONDS, readingDomain, signReading, type SignedReading } from "../src/shared/reading";
 import { MAX_EXPORT_WH, MAX_IMPORT_WH, TestMeter, domainFor, lastFinishedInterval } from "./helpers";
+
+const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+
+/**
+ * The same signature in encodings OpenZeppelin's ECDSA (and so EnergyToken) refuses: the
+ * first three are ones ethers accepts; the last is the malleable twin (s -> n - s, v flipped).
+ */
+function nonCanonical(signature: string): Record<string, string> {
+  const sig = Signature.from(signature);
+  const rs = sig.r + sig.s.slice(2);
+  const highS = (SECP256K1_N - BigInt(sig.s)).toString(16).padStart(64, "0");
+  return {
+    "64-byte compact (EIP-2098)": sig.compactSerialized,
+    "v = 0/1": rs + (sig.v - 27).toString(16).padStart(2, "0"),
+    "v = 35/36 (EIP-155 style)": rs + (sig.v - 27 + 35).toString(16),
+    "high s (malleated)": sig.r + highS + (sig.v === 27 ? "1c" : "1b"),
+  };
+}
 
 describe("Oracle", () => {
   describe("validation rules (off-chain, pure)", () => {
@@ -57,6 +77,14 @@ describe("Oracle", () => {
       const forged = await signReading(Wallet.createRandom(), domain, reading);
       expect(await codeFor({ reading, signature: forged })).to.equal("BAD_SIGNATURE");
       expect(await codeFor({ reading, signature: "0x1234" })).to.equal("BAD_SIGNATURE");
+    });
+
+    it("rejects signature encodings the contract would refuse (compact, v = 0/1, EIP-155 v, high s)", async () => {
+      const signed = await meter.sign({ intervalStart: T, exportedWh: 900 });
+      for (const [form, signature] of Object.entries(nonCanonical(signed.signature))) {
+        expect(await codeFor({ reading: signed.reading, signature }), form).to.equal("BAD_SIGNATURE");
+      }
+      expect(await codeFor(signed)).to.equal("OK");
     });
 
     it("rejects unregistered and suspended meters", async () => {
@@ -144,6 +172,94 @@ describe("Oracle", () => {
       expect(oracle.queueLength).to.equal(0);
       expect(await token.balanceOf(prosumer.address)).to.equal(300);
       expect(oracle.stats).to.include({ settled: 2, queued: 0 });
+    });
+
+    it("refuses exactly the signature encodings the contract refuses, so the genuine reading still settles", async () => {
+      const { token, oracleSigner, prosumer, meter, oracle, t0 } = await fixture();
+      const signed = await meter.sign({ intervalStart: t0, exportedWh: 750 });
+      for (const [form, signature] of Object.entries(nonCanonical(signed.signature))) {
+        await expect(token.connect(oracleSigner).submitReading(signed.reading, signature), form).to.be.revertedWithCustomError(
+          token,
+          "InvalidMeterSignature",
+        );
+        expect(await oracle.handle({ reading: signed.reading, signature }), form).to.include({ status: "rejected", code: "BAD_SIGNATURE" });
+      }
+      expect(await oracle.handle(signed)).to.include({ status: "settled", mintedWh: 750 });
+      expect(await token.balanceOf(prosumer.address)).to.equal(750);
+    });
+
+    it("forgets a reading the chain refused, so the same reading can settle once the cause is fixed", async () => {
+      const { token, admin, prosumer, meter, oracle, t0 } = await fixture();
+      const signed = await meter.sign({ intervalStart: t0, exportedWh: 400 });
+      await token.connect(admin).pause();
+      expect((await oracle.handle(signed)).status).to.equal("queued");
+
+      // The registrar suspends the meter while the reading waits in the queue.
+      await token.connect(admin).setMeterActive(meter.address, false);
+      await token.connect(admin).unpause();
+      await oracle.drain();
+      expect(oracle.rejections.at(-1)).to.include({ code: "ONCHAIN_REVERT", detail: "MeterNotActive" });
+
+      await token.connect(admin).setMeterActive(meter.address, true);
+      expect(await oracle.handle(JSON.parse(JSON.stringify(signed)))).to.include({ status: "settled", mintedWh: 400 });
+      expect(await token.balanceOf(prosumer.address)).to.equal(400);
+    });
+
+    it("reconciles a submission that was mined although its confirmation was lost", async () => {
+      const { token, oracleSigner, prosumer, meter, domain, t0 } = await loadFixture(deployFixture);
+      const real = token.connect(oracleSigner);
+      let loseConfirmation = true;
+      // Wrap the token so the first transaction is mined but wait() fails, like a dropped RPC response.
+      const flaky = new Proxy(real, {
+        get(target, prop) {
+          if (prop !== "submitReading") return target[prop as keyof EnergyToken];
+          return async (...args: Parameters<EnergyToken["submitReading"]>) => {
+            const tx = await target.submitReading(...args);
+            if (!loseConfirmation) return tx;
+            loseConfirmation = false;
+            await tx.wait();
+            return { hash: tx.hash, wait: () => Promise.reject(Object.assign(new Error("timeout"), { code: "TIMEOUT" })) };
+          };
+        },
+      });
+      const oracle = new Oracle(flaky, ethers.provider, domain);
+
+      expect((await oracle.handle(await meter.sign({ intervalStart: t0, exportedWh: 750 }))).status).to.equal("queued");
+      expect(await token.balanceOf(prosumer.address)).to.equal(750);
+      await oracle.drain();
+      expect(oracle.queueLength).to.equal(0);
+      expect(oracle.stats).to.include({ settled: 1, rejected: 0, queued: 0 });
+      expect(oracle.log.at(-1)).to.include({ status: "settled", mintedWh: 750 });
+    });
+
+    it("picks up the chain's cursor after a restart, so settled intervals stay settled", async () => {
+      const { token, oracleSigner, meter, domain, oracle, t0 } = await fixture();
+      const signed = await meter.sign({ intervalStart: t0, exportedWh: 300 });
+      expect((await oracle.handle(signed)).status).to.equal("settled");
+
+      const restarted = new Oracle(token.connect(oracleSigner), ethers.provider, domain);
+      expect(await restarted.handle(JSON.parse(JSON.stringify(signed)))).to.include({ code: "INTERVAL_ALREADY_SETTLED" });
+      expect(await restarted.handle(await meter.sign({ intervalStart: t0, exportedWh: 300 }))).to.include({
+        code: "INTERVAL_ALREADY_SETTLED",
+      });
+    });
+  });
+
+  describe("HTTP server", () => {
+    it(`answers 413 to bodies over ${MAX_BODY_BYTES / 1024} KB without handing them to the oracle`, async () => {
+      let handled = 0;
+      const stub = { handle: async () => (handled++, { status: "rejected", code: "MALFORMED" }), status: () => ({}) };
+      const server = await startOracleServer(stub as unknown as Oracle, 0);
+      const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/readings`;
+      try {
+        const small = await fetch(url, { method: "POST", body: "{}" });
+        expect(small.status).to.equal(422);
+        const big = await fetch(url, { method: "POST", body: "x".repeat(MAX_BODY_BYTES + 1) });
+        expect(big.status).to.equal(413);
+        expect(handled).to.equal(1);
+      } finally {
+        server.close();
+      }
     });
   });
 });

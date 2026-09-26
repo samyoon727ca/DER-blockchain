@@ -2,6 +2,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { ROOT_DIR, type Deployment } from "../shared/chain";
+import { BodyTooLarge, readBody } from "../shared/http";
 import { TARIFFS } from "../shared/participants";
 
 export interface DashboardOptions {
@@ -30,7 +31,10 @@ const READ_ONLY_RPC = new Set([
   "eth_getTransactionReceipt",
 ]);
 
-function isReadOnly(body: string): boolean {
+/** The dashboard's own requests are a few hundred bytes; anything this big is refused unread. */
+const MAX_RPC_BODY_BYTES = 64 * 1024;
+
+export function isReadOnly(body: string): boolean {
   try {
     const parsed = JSON.parse(body) as { method?: unknown } | { method?: unknown }[];
     const calls = Array.isArray(parsed) ? parsed : [parsed];
@@ -90,19 +94,14 @@ export function startDashboard(opts: DashboardOptions): Promise<http.Server> {
         return json(upstream.status, await upstream.text());
       }
       if (req.method === "POST" && url === "/rpc") {
-        const body = await new Promise<string>((resolve, reject) => {
-          const chunks: Buffer[] = [];
-          req.on("data", (c: Buffer) => chunks.push(c));
-          req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-          req.on("error", reject);
-        });
+        const body = await readBody(req, MAX_RPC_BODY_BYTES);
         if (!isReadOnly(body)) return json(403, JSON.stringify({ error: "dashboard RPC proxy is read-only" }));
         const upstream = await fetch(opts.rpcUrl, { method: "POST", headers: { "content-type": "application/json" }, body });
         return json(upstream.status, await upstream.text());
       }
       res.writeHead(404).end("not found");
     } catch (err) {
-      json(502, JSON.stringify({ error: (err as Error).message }));
+      json(err instanceof BodyTooLarge ? 413 : 502, JSON.stringify({ error: (err as Error).message }));
     }
   });
 

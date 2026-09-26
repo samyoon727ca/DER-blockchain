@@ -61,7 +61,7 @@ export class OrderBook {
 
 /** Only list once at least this much new energy has been credited. */
 const MIN_LISTING_WH = 1000n;
-/** A listing that has not sold for this long is discounted by 10%. */
+/** A listing still open this long after it was listed or last discounted is discounted by 10% (checked on the hour). */
 const REPRICE_AFTER_SECONDS = 2 * 3600;
 const REPRICE_FACTOR_BPS = 9000n;
 

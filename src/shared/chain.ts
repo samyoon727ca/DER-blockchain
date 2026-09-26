@@ -26,6 +26,8 @@ export interface ParticipantRecord {
   batteryKwh: number;
   maxExportWh: number;
   maxImportWh: number;
+  /** Mock stablecoin minted to this wallet at deployment, in whole USD (the only mUSD ever issued). Absent in older files. */
+  startingUsd?: number;
 }
 
 /** Written by the demo after deployment; read by the report script and the dashboard. */

@@ -24,7 +24,7 @@ import { Oracle } from "../src/oracle/oracle";
 import { startOracleServer } from "../src/oracle/server";
 import { SCENARIOS, type Phase, type ScenarioContext, type ScenarioOutcome } from "../src/scenarios/security";
 import { buildSettlement, renderMarkdown, saveReport, telemetryPath } from "../src/settlement/report";
-import { REPORTS_DIR, connectContracts, rpcProvider, saveDeployment, DEPLOYMENT_FILE } from "../src/shared/chain";
+import { REPORTS_DIR, connectContracts, revertName, rpcProvider, saveDeployment, DEPLOYMENT_FILE } from "../src/shared/chain";
 import { deployMarketplace } from "../src/shared/deploy";
 import { ACCOUNT_INDEX, PARTICIPANTS, hardhatWallet } from "../src/shared/participants";
 import { INTERVALS_PER_DAY, INTERVAL_SECONDS, readingDomain, type SignedReading } from "../src/shared/reading";
@@ -34,11 +34,22 @@ import { startDashboard } from "../src/dashboard/server";
 const args = new Set(process.argv.slice(2));
 const FAST = args.has("--fast");
 const EXIT_WHEN_DONE = args.has("--exit");
-const INTERVAL_DELAY_MS = FAST ? 0 : Number(process.env.DEMO_INTERVAL_MS ?? 350);
+/** Problems with the environment, reported by main() as one clear error. */
+const envErrors: string[] = [];
+function envInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (Number.isInteger(value) && value >= min && value <= max) return value;
+  envErrors.push(`${name} must be an integer from ${min} to ${max}, got "${raw}"`);
+  return fallback;
+}
+
+const INTERVAL_DELAY_MS = FAST ? 0 : envInt("DEMO_INTERVAL_MS", 350, 0, 60_000);
 const SIM_DATE = process.env.SIM_DATE ?? "2026-06-21";
-const RPC_PORT = Number(process.env.RPC_PORT ?? 8545);
-const ORACLE_PORT = Number(process.env.ORACLE_PORT ?? 8600);
-const DASHBOARD_PORT = Number(process.env.DASHBOARD_PORT ?? 3000);
+const RPC_PORT = envInt("RPC_PORT", 8545, 1, 65_535);
+const ORACLE_PORT = envInt("ORACLE_PORT", 8600, 1, 65_535);
+const DASHBOARD_PORT = envInt("DASHBOARD_PORT", 3000, 1, 65_535);
 
 const tty = process.stdout.isTTY;
 const color = (code: number) => (s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -48,6 +59,8 @@ const green = color(32);
 const red = color(31);
 const yellow = color(33);
 const cyan = color(36);
+
+const RECENT_INTERVALS = 8;
 
 interface HouseholdLive extends IntervalFlows {
   intervalStart: number;
@@ -61,7 +74,10 @@ const demo = {
   dayStart: 0,
   intervalIndex: -1,
   intervalsTotal: INTERVALS_PER_DAY,
+  /** The latest reading each meter submitted, whatever the oracle did with it. */
   households: {} as Record<string, HouseholdLive>,
+  /** Behind-the-meter flows of each meter's last few intervals, so the dashboard can show those of the settled one. */
+  recentFlows: {} as Record<string, Record<number, IntervalFlows>>,
   scenarios: [] as ScenarioOutcome[],
   marketLog: [] as (MarketEvent & { at: number })[],
   reportFile: null as string | null,
@@ -74,6 +90,9 @@ class DemoError extends Error {}
 
 /** Fail fast with a clear message if a port is taken (e.g. a previous demo is still running). */
 async function assertPortsFree(ports: [envVar: string, port: number][]): Promise<void> {
+  // Each probe closes before the next, so two services set to one port would both pass.
+  const clash = ports.find(([, port], i) => ports.findIndex(([, other]) => other === port) !== i);
+  if (clash) throw new DemoError(`${ports.map(([name]) => name).join(", ")} must all differ; ${clash[1]} is used twice.`);
   for (const [envVar, port] of ports) {
     await new Promise<void>((resolve, reject) => {
       const probe = net.createServer();
@@ -121,13 +140,17 @@ function closeServer(server: { close(cb?: () => void): unknown } | undefined): P
 }
 
 async function main() {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(SIM_DATE)) throw new DemoError(`SIM_DATE must be YYYY-MM-DD, got "${SIM_DATE}"`);
+  if (envErrors.length > 0) throw new DemoError(envErrors.join("\n"));
+  // Date.parse rolls impossible dates over (2026-02-30 -> March 2), so round-trip to be sure.
+  const dayStart = Date.parse(`${SIM_DATE}T00:00:00Z`) / 1000;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(SIM_DATE) || !Number.isFinite(dayStart) || new Date(dayStart * 1000).toISOString().slice(0, 10) !== SIM_DATE) {
+    throw new DemoError(`SIM_DATE must be a real calendar date as YYYY-MM-DD, got "${SIM_DATE}"`);
+  }
   await assertPortsFree([
     ["RPC_PORT", RPC_PORT],
     ["ORACLE_PORT", ORACLE_PORT],
     ["DASHBOARD_PORT", DASHBOARD_PORT],
   ]);
-  const dayStart = Date.parse(`${SIM_DATE}T00:00:00Z`) / 1000;
   demo.dayStart = dayStart;
 
   console.log(bold("\nDistributed energy marketplace — proof of concept"));
@@ -152,6 +175,8 @@ async function main() {
     simDate: SIM_DATE,
   });
   saveDeployment(deployment);
+  // Telemetry from an earlier run of the same date would not match this chain; it is rewritten at the end of the day.
+  fs.rmSync(telemetryPath(SIM_DATE), { force: true });
   const domain = readingDomain(deployment.chainId, deployment.contracts.energyToken);
   const adminContracts = connectContracts(deployment, admin);
 
@@ -188,6 +213,10 @@ async function main() {
   });
   await Promise.all([...prosumers, ...consumers].map((a) => a.approve()));
 
+  // Totals for the hourly progress table.
+  const newHour = () => ({ exported: 0, imported: 0, minted: 0, burned: 0, listed: 0, trades: 0, tradedWh: 0n, spent: 0n, ok: 0, late: 0, queued: 0, rejected: 0 });
+  let hour = newHour();
+
   const lastSettled = new Map<string, SignedReading>();
   const scenarioCtx: ScenarioContext = {
     deployment,
@@ -202,22 +231,41 @@ async function main() {
     participants: new Map(PARTICIPANTS.map((p) => [p.id, { wallet: wallets.get(p.id)!, contracts: participantContracts.get(p.id)! }])),
     lastSettled,
     drainOracle: async () => {
-      const before = oracle.stats.settled;
+      // Readings held while the token was paused settle now: count them in this hour's row.
+      const waiting = oracle.log.filter((e) => e.status === "queued");
       await oracle.drain();
-      return oracle.stats.settled - before;
+      const settled = waiting.filter((e) => e.status === "settled");
+      const refused = waiting.filter((e) => e.status === "rejected");
+      for (const e of settled) {
+        hour.minted += e.mintedWh ?? 0;
+        hour.burned += e.burnedWh ?? 0;
+      }
+      for (const e of refused) console.log(red(`  chain refused a queued reading from ${e.meter}: ${e.code} ${e.detail ?? ""}`));
+      hour.ok += settled.length;
+      hour.late += settled.length;
+      hour.rejected += refused.length;
+      hour.queued = Math.max(0, hour.queued - settled.length - refused.length);
+      return settled.length;
     },
   };
   const runScenarios = async (interval: number, phase: Phase, intervalStart: number) => {
     for (const hook of SCENARIOS.filter((s) => s.interval === interval && s.phase === phase)) {
-      const outcome = await hook.run(scenarioCtx, intervalStart);
-      if (outcome) recordScenario(outcome);
+      // A scenario that throws proves nothing: record it as a failure and carry on with the day.
+      const outcome = await hook.run(scenarioCtx, intervalStart).catch(
+        (err): ScenarioOutcome => ({
+          at: intervalStart,
+          title: `Scenario at ${hhmm(intervalStart)}`,
+          threat: "",
+          steps: [{ action: "Run the scenario", result: `NOT RUN: it failed with ${revertName(err)}`, blocked: false }],
+        }),
+      );
+      recordScenario(outcome);
     }
   };
 
   // 5. The simulated day ------------------------------------------------------------
   demo.phase = "running";
   console.log(dim("  Hour         Export   Import   Minted   Burned   Listings   Trades                  Oracle"));
-  let hour = { exported: 0, imported: 0, minted: 0, burned: 0, listed: 0, trades: 0, tradedWh: 0n, spent: 0n, ok: 0, queued: 0, rejected: 0 };
 
   for (let i = 0; i < INTERVALS_PER_DAY; i++) {
     const intervalStart = sim.intervalStart(i);
@@ -231,8 +279,14 @@ async function main() {
 
     await runScenarios(i, "before-readings", intervalStart);
 
-    // Meters sign their readings and send them to the oracle concurrently.
+    // Meters sign their readings and send them to the oracle concurrently. Their telemetry is
+    // published first, so the dashboard has it by the time any of these readings settles.
     const outputs = await sim.readInterval(i);
+    for (const o of outputs) {
+      const recent = (demo.recentFlows[o.participant.id] ??= {});
+      recent[intervalStart] = o.flows;
+      delete recent[intervalStart - RECENT_INTERVALS * INTERVAL_SECONDS];
+    }
     const responses = await Promise.all(outputs.map((o) => sendToOracle(oracleUrl, o.signed)));
     outputs.forEach((o, k) => {
       const res = responses[k];
@@ -275,13 +329,17 @@ async function main() {
     if (i % 4 === 3) {
       const h = hhmm(intervalEnd - 3600);
       const trades = `${hour.trades} (${formatKwh(hour.tradedWh, 1)} kWh, $${formatUsd(hour.spent)})`;
-      const oracleCol = `${hour.ok} settled` + (hour.queued ? yellow(`, ${hour.queued} queued`) : "") + (hour.rejected ? red(`, ${hour.rejected} rejected`) : "");
+      const oracleCol =
+        `${hour.ok} settled` +
+        (hour.late ? yellow(` (${hour.late} after queueing)`) : "") +
+        (hour.queued ? yellow(`, ${hour.queued} queued`) : "") +
+        (hour.rejected ? red(`, ${hour.rejected} rejected`) : "");
       console.log(
         `  ${h}–${hhmm(intervalEnd) === "00:00" ? "24:00" : hhmm(intervalEnd)}  ` +
           [hour.exported, hour.imported, hour.minted, hour.burned].map((wh) => formatKwh(wh, 1).padStart(6)).join("   ") +
           `   ${String(hour.listed).padStart(8)}   ${trades.padEnd(22)}  ${oracleCol}`,
       );
-      hour = { exported: 0, imported: 0, minted: 0, burned: 0, listed: 0, trades: 0, tradedWh: 0n, spent: 0n, ok: 0, queued: 0, rejected: 0 };
+      hour = newHour();
     }
 
     if (INTERVAL_DELAY_MS > 0) await sleep(INTERVAL_DELAY_MS);
@@ -304,10 +362,19 @@ async function main() {
   );
   console.log(`Report saved to ${demo.reportFile.replace(process.cwd() + "/", "")} (+ .json)\n`);
 
+  let shuttingDown = false;
   const shutdown = async (code: number) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    // An open dashboard tab keeps its keep-alive connections busy, so close() alone may never
+    // finish: drop those connections, and exit anyway if the chain's server lingers.
+    setTimeout(() => process.exit(code), 3000).unref();
     oracle.stop();
     provider.destroy();
-    await Promise.all([closeServer(oracleServer), closeServer(dashboard as http.Server), chain.close()]);
+    const servers: http.Server[] = [oracleServer, dashboard];
+    const closing = Promise.all([...servers.map(closeServer), chain.close()]);
+    for (const s of servers) s.closeAllConnections();
+    await closing.catch(() => undefined);
     process.exit(code);
   };
   const exitCode = checksOk && blocked ? 0 : 1;

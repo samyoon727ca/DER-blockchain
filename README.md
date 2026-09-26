@@ -17,7 +17,7 @@ These choices shape the whole PoC. Anything not listed here is covered under [Kn
 1. **Local chain only.** Contracts run on an in-process Hardhat node (chain id 31337) with Hardhat's public test mnemonic. No testnet, nothing of value.
 2. **1 token = 1 kWh of verified *exported* energy.** The token (`EKWH`) has 3 decimals, so one base unit is exactly 1 Wh and meters report whole Wh. Solar consumed behind the meter is never tokenized; only energy the grid meter records as exported is.
 3. **15-minute settlement intervals.** Each meter reports one reading per interval containing both exported and imported Wh.
-4. **"Consumed" means imported through the owner's meter.** When a reading shows import, up to that many credits are burned from the meter owner's wallet. Any import not covered by credits is ordinary grid supply, billed by the utility off-chain. Credits bought *after* the consumption do not cover it retroactively.
+4. **"Consumed" means imported through the owner's meter.** When a reading settles and shows import, up to that many credits are burned from the meter owner's wallet. Any import not covered by credits is ordinary grid supply, billed by the utility off-chain. The burn uses the wallet balance at settlement time, so it only matches the moment of consumption when readings settle promptly (as they do in the demo); a reading that settles late also burns credits bought in the meantime.
 5. **The P2P market is financial, not physical.** Electricity flows through the distribution grid as usual; the marketplace settles who pays whom. Grid constraints, network fees and locational pricing are out of scope.
 6. **Where the burn lives.** The brief groups "tokens are burned when the energy is consumed" with the marketplace. In this PoC the burn is triggered by the same meter-signed reading that mints, so it is implemented next to minting in `EnergyToken` (`CreditsBurned` event). `EnergyMarketplace` emits the listing, re-price, cancel and trade events. Together they emit an event for every listing, trade and burn.
 7. **One oracle and one admin.** A single oracle key holds `ORACLE_ROLE`. The deployer holds admin, registrar (meter onboarding) and pauser roles. The contract re-checks every reading, so the oracle is trusted for liveness, not correctness.
@@ -42,9 +42,9 @@ npm run demo
 | Command | What it does |
 |---|---|
 | `npm run demo` | Full paced demo; keeps running at the end so you can explore the dashboard |
-| `npm run demo:fast` | Same simulation with no pacing (about 45 s); exits with code 0 only if every integrity check and security scenario passed |
-| `npm test` | Unit tests for both contracts and the oracle (68 tests) |
-| `npm run report` | Rebuild the settlement report from the running chain (run in a second terminal while the demo is up) |
+| `npm run demo:fast` | Same simulation with no pacing (about a minute); exits with code 0 only if every integrity check passed and every security scenario ran and was handled safely |
+| `npm test` | Unit tests for the contracts, oracle, settlement report and dashboard proxy (88 tests) |
+| `npm run report` | Rebuild the settlement report from the running chain (run in a second terminal while the demo is up); exits with code 1 if an integrity check fails |
 | `npm run typecheck` | TypeScript type check of everything |
 | `npm run compile` | Compile contracts and generate TypeChain types |
 
@@ -111,13 +111,13 @@ sequenceDiagram
 | Component | Where | What it does |
 |---|---|---|
 | **EnergyToken** | `contracts/EnergyToken.sol` | ERC-20 + `AccessControl` + `Pausable` + EIP-712. Meter registry (owner, rated export, service limit). `submitReading` is the only way to mint: it verifies the meter's signature and replay/capacity rules on-chain, mints `exportedWh` to the owner, then burns up to `importedWh`. |
-| **EnergyMarketplace** | `contracts/EnergyMarketplace.sol` | Order book: `createListing` (escrows credits), `updatePrice`, `cancelListing` (always allowed, even when paused), `buy` with partial fills and a `maxPricePerKwh` guard. Payment goes straight to the seller. `ReentrancyGuard`, `SafeERC20`, pausable, no loops. |
+| **EnergyMarketplace** | `contracts/EnergyMarketplace.sol` | Order book: `createListing` (escrows credits), `updatePrice`, `cancelListing` (still allowed while the marketplace is paused; like every credit transfer, blocked while EnergyToken is paused), `buy` with partial fills and a `maxPricePerKwh` guard. Payment goes straight to the seller. `ReentrancyGuard`, `SafeERC20`, pausable, no loops. |
 | **MockStablecoin** | `contracts/MockStablecoin.sol` | 6-decimal test dollar; owner-only mint. |
 | **Meter simulator** | `src/meter-simulator/` | Solar geometry plus a neighbourhood-wide cloud model, household load curves with noise, batteries (self-consumption, 90% round trip), an EV charger. Each `SmartMeter` holds its own key and a monotonic nonce and signs every reading. |
-| **Oracle service** | `src/oracle/` | HTTP API (`POST /readings`, `GET /status`). Pure validation rules in `validation.ts`; `oracle.ts` relays accepted readings in order and keeps them queued while the token is paused. |
+| **Oracle service** | `src/oracle/` | HTTP API (`POST /readings`, `GET /status`). Pure validation rules in `validation.ts`; `oracle.ts` relays accepted readings in order, keeps them queued while the token is paused, reconciles a submission whose confirmation was lost from its receipt, and forgets a reading the chain refuses so a correct copy can still settle. |
 | **Trading agents** | `src/market/agents.ts` | Prosumers list new credits, discount unsold listings and withdraw them at a price floor. Consumers keep about four hours of expected consumption covered, buying the cheapest listings under their price limit. |
 | **Security scenarios** | `src/scenarios/security.ts` | Attacks and failures injected during the day, run for real against the oracle and contracts. |
-| **Settlement report** | `src/settlement/report.ts`, `scripts/report.ts` | Rebuilds each participant's production, sales, purchases, earnings and savings from chain events, plus six integrity checks. |
+| **Settlement report** | `src/settlement/report.ts`, `scripts/report.ts` | Rebuilds each participant's production, sales, purchases, earnings and savings from chain events, all read at one block, plus six integrity checks (including re-verifying every reading's meter signature from the transaction calldata). |
 | **Dashboard** | `src/dashboard/` | Plain HTML/JS with ethers.js. Reads balances, listings, trades and readings straight from the chain, plus oracle decisions and simulator telemetry. |
 | **Demo orchestrator** | `scripts/demo.ts` | Starts everything and drives the 96 intervals. |
 
@@ -163,7 +163,7 @@ The meter signs this struct with EIP-712 under the domain `{name: "EnergyToken",
 | Check | Oracle (off-chain) | EnergyToken (on-chain) |
 |---|---|---|
 | Well-formed body, integer ranges | `MALFORMED` | enforced by ABI types |
-| Signed by the claimed meter | `BAD_SIGNATURE` | `InvalidMeterSignature` |
+| Signed by the claimed meter, in the only encoding the contract accepts (65 bytes, v = 27/28, low s) | `BAD_SIGNATURE` | `InvalidMeterSignature` |
 | Meter registered and active | `UNKNOWN_METER`, `METER_INACTIVE` | `UnknownMeter`, `MeterNotActive` |
 | Interval on a 15-minute boundary | `MISALIGNED_INTERVAL` | `IntervalNotAligned` |
 | Interval already finished | `FUTURE_INTERVAL` | `IntervalNotFinished` |
@@ -212,10 +212,10 @@ Cost of a purchase is `amountWh × pricePerKwh / 1000`, rounded up to the smalle
 
 Agent rules:
 
-- **Prosumers** list each new kWh of credits at their ask price. A listing that hasn't sold for two hours is discounted 10%; one that would fall below $0.08/kWh is withdrawn and the credits are kept to cover the household's own evening import.
-- **Consumers** keep enough credits for their expected consumption over the next four hours, buying cheapest listings first, up to their price limit, and always passing the price they saw as `maxPricePerKwh`.
+- **Prosumers** list each new kWh of credits at their ask price. A listing still open two hours after it was listed or last discounted is discounted 10% (checked on the hour, whether or not part of it has sold); one that would fall below $0.08/kWh is withdrawn and the credits are kept to cover the household's own evening import.
+- **Consumers** keep enough credits for their expected consumption over the next four hours (including the average contribution of random appliance use), buying cheapest listings first, up to their price limit, and always passing the price they saw as `maxPricePerKwh`.
 
-Security scenarios injected into the day (each one is a real attempt against the running system):
+Security scenarios injected into the day (each one is a real attempt against the running system; the 11:00 and pause attempts are simulated calls, `eth_call`, against the live chain so the attacker's transactions leave no trace):
 
 | Time | Scenario | Expected outcome |
 |---|---|---|
@@ -223,8 +223,10 @@ Security scenarios injected into the day (each one is a real attempt against the
 | 09:30 | Replay and double counting: re-send P2's settled reading; P2's meter re-signs the same interval with a new nonce | Oracle rejects: `DUPLICATE`, `INTERVAL_ALREADY_SETTLED` |
 | 10:00 | Implausible production: P4's meter signs 3× its rated export | Oracle rejects: `EXPORT_ABOVE_CAPACITY` |
 | 11:00 | Compromised oracle: the oracle key calls the contract directly with a forged reading, a replayed reading, and a meter registration; an outsider submits a reading | Contract reverts: `InvalidMeterSignature`, `IntervalAlreadySettled`, `AccessControlUnauthorizedAccount` (×2) |
-| 12:00 | Front-running: with auto-mining off, a seller re-prices a listing with a higher tip than a pending buy | Both land in one block, re-price first; the buy reverts with `PriceAboveLimit` and the buyer pays nothing |
-| 13:00–13:15 | Emergency pause of EnergyToken | 10 readings queue at the oracle, trading halts; after unpause all 10 settle in order |
+| 12:00 | Front-running: with auto-mining off, a seller re-prices a listing with a higher tip than a pending buy. If no household listing is open (e.g. in winter), the prosumer holding the most credits lists some first; afterwards the price is restored (or that listing cancelled) so the attack does not distort the rest of the day | Both land in one block, re-price first; the buy reverts with `PriceAboveLimit` and the buyer pays nothing |
+| 13:00–13:15 | Emergency pause of EnergyToken | A household's attempt to list credits reverts with `EnforcedPause`; all 10 readings queue at the oracle; after unpause all 10 settle and every meter is settled through 13:00 |
+
+A scenario that cannot be set up is reported as NOT RUN and counts as a failure, so `demo:fast` never exits 0 without having exercised every protection.
 
 ---
 
@@ -234,29 +236,29 @@ Produced at the end of every demo run (and by `npm run report`). Excerpt from th
 
 **Prosumers** (kWh unless noted)
 
-| Prosumer | PV generated | Exported (minted) | Sold P2P | Earnings | Avg price | vs feed-in | Self-used credits |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| P1 · 6 kW PV + 10 kWh battery | 37.17 | 17.07 | 16.73 | $2.34 | $0.140 | +$1.51 | 0.00 |
-| P2 · 4.5 kW PV | 27.73 | 19.89 | 18.52 | $2.22 | $0.120 | +$1.30 | 1.37 |
-| P3 · 8 kW PV + 13.5 kWh battery | 49.20 | 22.57 | 21.72 | $3.25 | $0.150 | +$2.16 | 0.00 |
-| P4 · 5 kW PV | 30.56 | 19.84 | 18.82 | $2.45 | $0.130 | +$1.51 | 1.02 |
-| P5 · 7 kW PV + 10 kWh battery | 43.36 | 23.18 | 23.00 | $3.22 | $0.140 | +$2.07 | 0.00 |
+| Prosumer | PV generated | Exported (minted) | Sold P2P | Earnings | Avg price | vs feed-in | Self-used credits | Grid-supplied |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| P1 · 6 kW PV + 10 kWh battery | 37.17 | 17.07 | 16.73 | $2.34 | $0.140 | +$1.51 | 0.00 | 0.00 |
+| P2 · 4.5 kW PV | 27.73 | 19.89 | 18.52 | $2.22 | $0.120 | +$1.30 | 1.37 | 6.83 |
+| P3 · 8 kW PV + 13.5 kWh battery | 49.20 | 22.57 | 21.72 | $3.19 | $0.147 | +$2.10 | 0.00 | 0.00 |
+| P4 · 5 kW PV | 30.56 | 19.84 | 18.82 | $2.45 | $0.130 | +$1.51 | 1.02 | 6.89 |
+| P5 · 7 kW PV + 10 kWh battery | 43.36 | 23.18 | 23.00 | $3.25 | $0.141 | +$2.10 | 0.00 | 0.00 |
 
 **Consumers**
 
 | Consumer | Load | Bought P2P | Spent | Avg price | Consumed from credits | Grid-supplied | Saved vs grid |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| C1 · family home | 26.97 | 19.57 | $2.69 | $0.138 | 18.62 | 8.35 | +$3.18 |
-| C2 · apartment | 11.55 | 8.21 | $1.10 | $0.134 | 8.21 | 3.33 | +$1.37 |
-| C3 · home + EV charging | 38.79 | 33.14 | $4.57 | $0.138 | 32.03 | 6.75 | +$5.37 |
-| C4 · home office | 23.91 | 16.98 | $2.32 | $0.137 | 16.98 | 6.93 | +$2.77 |
-| C5 · small café | 34.19 | 20.89 | $2.79 | $0.134 | 20.89 | 13.30 | +$3.47 |
+| C1 · family home | 26.97 | 18.61 | $2.50 | $0.134 | 18.61 | 8.36 | +$3.08 |
+| C2 · apartment | 11.55 | 8.36 | $1.13 | $0.135 | 8.36 | 3.19 | +$1.38 |
+| C3 · home + EV charging | 38.79 | 33.28 | $4.60 | $0.138 | 31.90 | 6.89 | +$5.16 |
+| C4 · home office | 23.91 | 17.41 | $2.37 | $0.136 | 17.04 | 6.87 | +$2.79 |
+| C5 · small café | 34.19 | 21.14 | $2.85 | $0.135 | 21.14 | 13.04 | +$3.50 |
 
-Totals: 102.55 kWh minted, 98.80 kWh traded for $13.48 (average $0.136/kWh), 99.13 kWh burned on consumption, 3.42 kWh of credits outstanding.
+Totals: 102.55 kWh minted, 98.80 kWh traded for $13.45 (average $0.136/kWh), 99.44 kWh burned on consumption, 3.10 kWh of credits outstanding.
 
-Integrity checks (all pass): every credit traces to a signed reading · no interval credited twice · supply = minted − burned · supply = wallets + escrow · escrow = open listings · stablecoin conserved.
+Integrity checks (all pass): every credit traces to a signed reading (each reading's meter signature, owner and minted amount re-verified from the transaction calldata) · no interval credited twice · supply = minted − burned · supply = wallets + escrow · escrow = open listings · stablecoin conserved (every balance equals its deployment funding plus sales minus purchases).
 
-"PV generated" and "Load" come from simulator telemetry because they happen behind the meter; every other figure is read from chain events.
+"PV generated" and "Load" come from simulator telemetry because they happen behind the meter; every other figure is read from chain events, all as of one block. "Saved vs grid" counts only imports that credits actually covered: their cost at grid retail minus what those credits cost; credits still held are not counted.
 
 ---
 
@@ -268,12 +270,12 @@ Integrity checks (all pass): every credit traces to a signed reading · no inter
 - headline figures: credits minted, traded peer-to-peer, credits burned, average P2P price, oracle decisions
 - neighbourhood export and import per 15-minute interval (hover for values)
 - income per prosumer
-- meter readings: latest settled interval per meter, with PV, load and battery state
+- meter readings: latest settled interval per meter, with PV, load and battery state for that interval, and the status of each meter's most recent reading
 - balances: credits in wallet and in escrow, stablecoin, sold or bought kWh, earned or spent
 - open listings and trade history
-- security scenario outcomes and the oracle feed, with every rejected reading pinned
+- security scenario outcomes and the oracle feed, with the latest 100 rejected readings pinned
 
-The browser talks to the chain through a proxy that only forwards read-only JSON-RPC methods.
+The browser talks to the chain through a proxy that only forwards read-only JSON-RPC methods (requests over 64 KB get a 413). If the demo is restarted with the page open, the page notices the new chain and reloads itself.
 
 ---
 
@@ -283,11 +285,13 @@ The browser talks to the chain through a proxy that only forwards read-only JSON
 npm test
 ```
 
-68 tests in three files:
+88 tests in five files:
 
-- `test/EnergyToken.test.ts`: metadata; role setup; meter registry (registrar-only, no re-registration, suspend and reinstate); minting (oracle-only, no other mint path, revoked oracle, capacity limits); signatures (wrong key, tampered fields, cross-contract replay, malformed, unregistered meter, digest parity with off-chain code); replay and double counting (exact replay, same interval with a new nonce, older interval, stale nonce, nonce gaps, unfinished and misaligned intervals); consumption burn (partial, capped at balance, none, netting); pause; role administration.
-- `test/EnergyMarketplace.test.ts`: escrow on listing; zero checks; no double selling; approvals; full and partial fills; rounding; over-buying; self-trade; unknown listing; unpayable buys; front-running protection; re-pricing permissions; cancellation; burn of purchased credits; escrow not burnable; pause (with cancel always allowed); token pause halting trades; access control.
-- `test/Oracle.test.ts`: every validation rule on its own, plus the service against a local chain (settle, reject replay, queue while paused and drain in order).
+- `test/EnergyToken.test.ts`: metadata; role setup; meter registry (registrar-only, no re-registration, suspend and reinstate); minting (oracle-only, no other mint path, revoked oracle, capacity limits); signatures (wrong key, tampered fields, cross-contract and cross-chain replay, malformed, unregistered meter, digest parity with off-chain code); replay and double counting (exact replay, same interval with a new nonce, older interval, stale nonce, nonce gaps, unfinished and misaligned intervals); consumption burn (partial, capped at balance, none, netting); pause (mint, burn and transfers); role administration.
+- `test/EnergyMarketplace.test.ts`: escrow on listing; zero checks; no double selling; approvals; full and partial fills; rounding; over-buying; self-trade; unknown listing; unpayable buys; front-running protection; re-pricing permissions; cancellation; burn of purchased credits; escrow not burnable; marketplace pause (cancel still allowed); token pause halting trades and freezing escrow until unpause; access control.
+- `test/Oracle.test.ts`: every validation rule on its own, including signature encodings the contract would refuse; the service against a local chain (settle, reject replay, queue while paused and drain in order, parity with the contract on signature encodings, forgetting a reading the chain refused, reconciling a lost confirmation, cursor after a restart); the HTTP server's 16 KB body cap.
+- `test/Settlement.test.ts`: the report on a small traded history (figures and integrity checks), reading at one block while more readings settle mid-report, signature re-verification from calldata (including uint64 nonces beyond JavaScript's safe integers), credits held outside the demo's wallets, and stablecoin issued after funding.
+- `test/Dashboard.test.ts`: the read-only RPC allowlist (reads, writes, mixed batches, malformed requests) and the proxy server (forwards reads, 403 for writes, 413 for oversized bodies).
 
 ---
 
@@ -309,7 +313,9 @@ The full analysis, with code pointers and residual risks, is in **[docs/THREAT_M
 ## Known limitations
 
 - **Single oracle.** It cannot mint on its own, but it can withhold or delay readings. The retry queue is in memory and is lost if the process dies.
-- **Meter trust.** A meter whose key is extracted can report any value up to its rated capacity; the only plausibility check is that cap (no irradiance model, no comparison with neighbours).
+- **Burn timing.** The consumption burn uses the owner's balance when a reading settles, not when the energy was used. A reading that settles late (an offline meter, a paused token, a slow or malicious oracle) also burns credits bought in the meantime.
+- **Local chain RPC.** The in-process Hardhat node on `127.0.0.1:8545` is unauthenticated, accepts cross-origin requests and holds unlocked accounts, including the admin. While the demo runs, any local process, or a web page the browser lets reach localhost, can send transactions to it. The dashboard's read-only proxy protects only the dashboard's own endpoint.
+- **Meter trust.** A meter whose key is extracted can report any value up to its rated capacity; the only plausibility check is that cap (no irradiance model, no comparison with neighbours). The 6-hour age limit is enforced only by the oracle, so with the oracle key as well such a meter could backfill every interval since its last settled one.
 - **Privacy.** Every 15-minute reading is public on-chain, which reveals household routines.
 - **Market design.** A first-come order book with no time matching (noon solar can cover evening use), no grid constraints and no network fees. Credits never expire. Dust listings can linger until withdrawn.
 - **Admin key.** A single externally owned account holds admin, registrar and pauser roles. No multisig, timelock or upgrade path.
