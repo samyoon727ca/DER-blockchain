@@ -66,6 +66,7 @@ The key design decision is **defence in depth at trust boundary 2**: `EnergyToke
 **Residual risk / deferred.**
 - **Censorship and delay.** A single oracle can drop or hold readings (liveness). Readings are also only accepted in order, so dropping one reading does not block later ones (nonce gaps are allowed) but its energy is never credited.
 - **Selective submission.** It could favour some meters over others.
+- **Revoking the oracle drops its queue.** Readings it still holds are refused on-chain once its role is revoked, and are dropped (the oracle forgets them, so they could be re-sent); the demo's meters do not re-send, so a replacement oracle only settles readings from then on.
 - **Burn timing.** The consumption burn uses the owner's balance when the reading settles. By holding an import reading back (up to the 6-hour window the oracle accepts, and on-chain without limit), an oracle makes it burn credits the household bought after the consumption.
 - Production: several independent oracle operators with a k-of-n threshold (or a decentralised oracle network), meters able to submit directly as a fallback, public monitoring that compares meter-published hashes with settled readings, and a dispute window.
 
@@ -130,7 +131,7 @@ The key design decision is **defence in depth at trust boundary 2**: `EnergyToke
 - `ReentrancyGuard` and checks-effects-interactions on every marketplace function that moves tokens; `SafeERC20` for transfers.
 - No loops anywhere in the contracts: every function does constant work, so no call can run out of gas as state grows. Open listings are enumerated off-chain from events.
 - Cost rounding is up (`Math.mulDiv(..., Ceil)`), so dust purchases are never free.
-- 85 unit tests covering minting rules, trades, access control, pause, replay, the oracle, the settlement report's integrity checks and the dashboard proxy.
+- 87 unit tests covering minting rules, trades, access control, pause, replay, the oracle, the settlement report's integrity checks and the dashboard proxy.
 
 **Deferred.** Independent audit, fuzzing / invariant tests (e.g. supply = minted − burned under random operations), formal verification of the reading checks.
 
