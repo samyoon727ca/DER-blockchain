@@ -1,14 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { Provider } from "ethers";
+import { ZeroAddress, type Provider } from "ethers";
 import { REPORTS_DIR, connectContracts, type Deployment } from "../shared/chain";
 import { TARIFFS } from "../shared/participants";
-import { hhmm } from "../shared/units";
+import { readingDomain, recoverReadingSigner, type MeterReading } from "../shared/reading";
+import { USD, hhmm } from "../shared/units";
 
 /**
  * Settlement report for the simulated period, built from on-chain events only
  * (plus optional simulator telemetry for behind-the-meter PV and load, which
- * the chain never sees).
+ * the chain never sees). Everything is read at one block, so events and
+ * balances agree even while the demo keeps mining.
  */
 
 export interface Telemetry {
@@ -38,7 +40,11 @@ export interface ParticipantSettlement {
   stablecoinUsd: number;
   /** Prosumer: revenue minus what the same energy earns at the utility feed-in tariff. */
   upliftVsFeedInUsd: number;
-  /** Consumer: what the bought energy would cost at grid retail minus what was paid. */
+  /**
+   * Consumer: grid retail cost of the imports that credits covered (burned credits),
+   * minus what those credits cost at the average purchase price. Credits still
+   * held have not displaced any grid energy yet, so they do not count.
+   */
   savingsVsGridUsd: number;
 }
 
@@ -50,6 +56,7 @@ export interface IntegrityCheck {
 
 export interface SettlementReport {
   simDate: string;
+  block: number; // every figure is read as of this block
   period: { from: number | null; to: number | null };
   counts: { readings: number; listings: number; trades: number; cancellations: number };
   participants: ParticipantSettlement[];
@@ -76,13 +83,17 @@ export async function buildSettlement(
   telemetry?: Telemetry,
 ): Promise<SettlementReport> {
   const { token, market, stable } = connectContracts(deployment, provider);
-  const [readings, minted, burned, created, trades, cancelled] = await Promise.all([
-    token.queryFilter(token.filters.ReadingSettled()),
-    token.queryFilter(token.filters.CreditsMinted()),
-    token.queryFilter(token.filters.CreditsBurned()),
-    market.queryFilter(market.filters.ListingCreated()),
-    market.queryFilter(market.filters.Trade()),
-    market.queryFilter(market.filters.ListingCancelled()),
+  const blockTag = await provider.getBlockNumber();
+  const at = { blockTag };
+  const [transfers, readings, minted, burned, registered, created, trades, cancelled] = await Promise.all([
+    token.queryFilter(token.filters.Transfer(), 0, blockTag),
+    token.queryFilter(token.filters.ReadingSettled(), 0, blockTag),
+    token.queryFilter(token.filters.CreditsMinted(), 0, blockTag),
+    token.queryFilter(token.filters.CreditsBurned(), 0, blockTag),
+    token.queryFilter(token.filters.MeterRegistered(), 0, blockTag),
+    market.queryFilter(market.filters.ListingCreated(), 0, blockTag),
+    market.queryFilter(market.filters.Trade(), 0, blockTag),
+    market.queryFilter(market.filters.ListingCancelled(), 0, blockTag),
   ]);
 
   type Acc = Record<
@@ -137,21 +148,67 @@ export async function buildSettlement(
   // Credits still in escrow, per seller (only listings that are still open).
   let escrowTotal = 0n;
   for (const ev of created) {
-    const l = await market.getListing(ev.args.listingId);
+    const l = await market.getListing(ev.args.listingId, at);
     if (l.active) {
       byWallet(l.seller).escrow += l.remainingWh;
       escrowTotal += l.remainingWh;
     }
   }
 
+  // Re-verify every settled reading instead of trusting the contract's events:
+  // decode the submitReading call that produced it, recover the meter's own
+  // EIP-712 signature, and check the call matches the event, the credits went
+  // to the meter's registered owner and exactly the signed export was minted.
+  const domain = readingDomain(deployment.chainId, deployment.contracts.energyToken);
+  const ownerOf = new Map(registered.map((ev) => [ev.args.meter, ev.args.owner]));
+  const mintedInTx = new Map<string, bigint>();
+  for (const ev of minted) mintedInTx.set(ev.transactionHash, (mintedInTx.get(ev.transactionHash) ?? 0n) + ev.args.amountWh);
+  const txs = await Promise.all(readings.map((ev) => provider.getTransaction(ev.transactionHash)));
+  const verifiedTxs = new Set<string>();
+  readings.forEach((ev, i) => {
+    const tx = txs[i];
+    if (!tx || tx.to?.toLowerCase() !== deployment.contracts.energyToken.toLowerCase()) return;
+    const call = token.interface.parseTransaction({ data: tx.data });
+    if (call?.name !== "submitReading") return;
+    const [r, signature] = call.args as unknown as [Record<keyof MeterReading, string | bigint>, string];
+    const reading: MeterReading = {
+      meter: String(r.meter),
+      intervalStart: Number(r.intervalStart),
+      exportedWh: Number(r.exportedWh),
+      importedWh: Number(r.importedWh),
+      nonce: Number(r.nonce),
+    };
+    const matchesEvent =
+      reading.meter === ev.args.meter &&
+      BigInt(reading.intervalStart) === ev.args.intervalStart &&
+      BigInt(reading.exportedWh) === ev.args.exportedWh &&
+      BigInt(reading.importedWh) === ev.args.importedWh &&
+      BigInt(reading.nonce) === ev.args.nonce;
+    if (
+      matchesEvent &&
+      recoverReadingSigner(domain, reading, signature) === reading.meter &&
+      ownerOf.get(reading.meter) === ev.args.owner &&
+      (mintedInTx.get(ev.transactionHash) ?? 0n) === ev.args.exportedWh
+    ) {
+      verifiedTxs.add(ev.transactionHash);
+    }
+  });
+  const untracedMints = minted.filter((ev) => !verifiedTxs.has(ev.transactionHash)).length;
+
   const participants: ParticipantSettlement[] = [];
   let walletCreditsTotal = 0n;
   let stableTotal = 0n;
+  let fundedTotal = 0n;
+  let unreconciledBalances = 0;
   for (const p of deployment.participants) {
     const a = byWallet(p.wallet);
-    const [walletCredits, stableBalance] = await Promise.all([token.balanceOf(p.wallet), stable.balanceOf(p.wallet)]);
+    const [walletCredits, stableBalance] = await Promise.all([token.balanceOf(p.wallet, at), stable.balanceOf(p.wallet, at)]);
     walletCreditsTotal += walletCredits;
     stableTotal += stableBalance;
+    // After deployment funding, mUSD may only move through marketplace trades.
+    const funded = BigInt(p.startingUsd) * USD;
+    fundedTotal += funded;
+    if (stableBalance !== funded + a.revenue - a.spent) unreconciledBalances++;
     const t = telemetry?.[p.id];
     participants.push({
       id: p.id,
@@ -175,20 +232,27 @@ export async function buildSettlement(
       creditsInOpenListingsKwh: kwh(a.escrow),
       stablecoinUsd: usd(stableBalance),
       upliftVsFeedInUsd: usd(a.revenue) - kwh(a.sold) * TARIFFS.feedInUsdPerKwh,
-      savingsVsGridUsd: kwh(a.bought) * TARIFFS.gridRetailUsdPerKwh - usd(a.spent),
+      savingsVsGridUsd:
+        kwh(a.burned) * TARIFFS.gridRetailUsdPerKwh - (a.bought > 0n ? (usd(a.spent) * Number(a.burned)) / Number(a.bought) : 0),
     });
   }
 
   const [totalSupply, marketEscrow, stableSupply] = await Promise.all([
-    token.totalSupply(),
-    token.balanceOf(deployment.contracts.marketplace),
-    stable.totalSupply(),
+    token.totalSupply(at),
+    token.balanceOf(deployment.contracts.marketplace, at),
+    stable.totalSupply(at),
   ]);
+  // Credits are an ordinary ERC-20, so households may also have sent some to wallets outside the demo.
+  const known = new Set([ZeroAddress, deployment.contracts.marketplace, ...deployment.participants.map((p) => p.wallet)].map((w) => w.toLowerCase()));
+  const outsiders = [...new Set(transfers.map((ev) => ev.args.to.toLowerCase()))].filter((w) => !known.has(w));
+  const outsideCredits = (await Promise.all(outsiders.map((w) => token.balanceOf(w, at)))).reduce((s, b) => s + b, 0n);
   const checks: IntegrityCheck[] = [
     {
       name: "Every credit traces to a signed meter reading",
-      ok: mintedTotal === exportedTotal,
-      detail: `minted ${kwh(mintedTotal)} kWh = verified exports ${kwh(exportedTotal)} kWh`,
+      ok: verifiedTxs.size === readings.length && untracedMints === 0 && mintedTotal === exportedTotal,
+      detail:
+        `${verifiedTxs.size} of ${readings.length} readings re-verified from calldata (meter signature, registered owner, amount minted), ` +
+        `${untracedMints} mints without one; minted ${kwh(mintedTotal)} kWh = signed exports ${kwh(exportedTotal)} kWh`,
     },
     {
       name: "No interval credited twice",
@@ -202,24 +266,33 @@ export async function buildSettlement(
     },
     {
       name: "Supply = wallets + marketplace escrow",
-      ok: totalSupply === walletCreditsTotal + marketEscrow,
-      detail: `${kwh(walletCreditsTotal)} kWh in wallets + ${kwh(marketEscrow)} kWh in escrow`,
+      ok: totalSupply === walletCreditsTotal + outsideCredits + marketEscrow,
+      detail:
+        `${kwh(walletCreditsTotal)} kWh in participant wallets + ${kwh(outsideCredits)} kWh in ${outsiders.length} other wallets` +
+        ` + ${kwh(marketEscrow)} kWh in escrow`,
     },
     {
       name: "Escrow = open listings",
       ok: marketEscrow === escrowTotal,
-      detail: `marketplace holds ${kwh(marketEscrow)} kWh; open listings total ${kwh(escrowTotal)} kWh`,
+      detail:
+        `marketplace holds ${kwh(marketEscrow)} kWh; open listings total ${kwh(escrowTotal)} kWh` +
+        (marketEscrow > escrowTotal
+          ? ` (${kwh(marketEscrow - escrowTotal)} kWh was transferred to the marketplace outside any listing and cannot be recovered)`
+          : ""),
     },
     {
       name: "Stablecoin conserved (payments only move between participants)",
-      ok: stableTotal === stableSupply,
-      detail: `participants hold $${usd(stableTotal).toFixed(2)} of $${usd(stableSupply).toFixed(2)} issued`,
+      ok: stableSupply === fundedTotal && stableTotal === stableSupply && unreconciledBalances === 0,
+      detail:
+        `$${usd(stableSupply).toFixed(2)} issued vs $${usd(fundedTotal).toFixed(2)} funded at deployment; ` +
+        `participants hold $${usd(stableTotal).toFixed(2)}; ${unreconciledBalances} balances differ from funding + sales - purchases`,
     },
   ];
 
   const times = readings.map((r) => Number(r.args.intervalStart));
   return {
     simDate: deployment.simDate,
+    block: blockTag,
     period: { from: times.length ? Math.min(...times) : null, to: times.length ? Math.max(...times) + 900 : null },
     counts: { readings: readings.length, listings: created.length, trades: trades.length, cancellations: cancelled.length },
     participants,
@@ -264,7 +337,7 @@ export function renderMarkdown(r: SettlementReport): string {
   return [
     `# Settlement report — ${r.simDate}`,
     "",
-    `Period ${period} · ${r.counts.readings} verified readings · ${r.counts.listings} listings · ${r.counts.trades} trades · ${r.counts.cancellations} cancellations`,
+    `Period ${period} · ${r.counts.readings} verified readings · ${r.counts.listings} listings · ${r.counts.trades} trades · ${r.counts.cancellations} cancellations · chain state as of block ${r.block}`,
     "",
     `Tariff assumptions: grid retail $${r.tariffs.gridRetailUsdPerKwh.toFixed(2)}/kWh, utility feed-in $${r.tariffs.feedInUsdPerKwh.toFixed(2)}/kWh.`,
     "Energy figures in kWh. \"PV generated\" and \"Load\" are simulator telemetry (behind the meter); everything else is read from the chain.",
@@ -272,7 +345,7 @@ export function renderMarkdown(r: SettlementReport): string {
     "## Prosumers",
     "",
     table(
-      ["Prosumer", "PV generated", "Exported (minted)", "Sold P2P", "Earnings", "Avg price", "vs feed-in", "Self-used credits", "Unsold (listed / wallet)"],
+      ["Prosumer", "PV generated", "Exported (minted)", "Sold P2P", "Earnings", "Avg price", "vs feed-in", "Self-used credits", "Grid-supplied", "Unsold (listed / wallet)"],
       prosumers.map((p) => [
         p.label,
         f2(p.pvGeneratedKwh),
@@ -282,6 +355,7 @@ export function renderMarkdown(r: SettlementReport): string {
         price(p.avgSaleUsdPerKwh),
         signedMoney(p.upliftVsFeedInUsd),
         f2(p.creditsBurnedKwh),
+        f2(p.gridSuppliedKwh),
         `${f2(p.creditsInOpenListingsKwh)} / ${f2(p.creditsInWalletKwh)}`,
       ]),
     ),
