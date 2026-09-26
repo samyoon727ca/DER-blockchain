@@ -17,15 +17,16 @@ const usd = (units, digits = 2) => {
   return v > 0 && v < 0.01 ? "<$0.01" : `$${v.toFixed(digits)}`;
 };
 const perKwh = (units) => `$${(Number(units) / 1e6).toFixed(3)}`;
-// Timestamps can come from untrusted oracle submissions, so out-of-range values render as a dash.
+// Timestamps can come from untrusted oracle submissions, so out-of-range values render as a dash
+// (past year 9999, toISOString switches to a longer year format that the slice would garble).
 const hhmm = (ts) => {
   const d = new Date(Number(ts) * 1000);
-  return Number.isFinite(d.getTime()) ? d.toISOString().slice(11, 16) : "–";
+  return Number.isFinite(d.getTime()) && d.getUTCFullYear() <= 9999 ? d.toISOString().slice(11, 16) : "–";
 };
 const span = (t0) => {
   const from = hhmm(t0);
   const to = hhmm(Number(t0) + INTERVAL);
-  return from === "–" ? "–" : `${from}–${to === "00:00" ? "24:00" : to}`;
+  return from === "–" || to === "–" ? "–" : `${from}–${to === "00:00" ? "24:00" : to}`;
 };
 const shortAddr = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 
@@ -635,6 +636,9 @@ function renderTrades(person) {
   );
 }
 
+/** A step the demo could not set up: it proves nothing, but it is not a security failure either. */
+const isNotRun = (step) => step.result.startsWith("NOT RUN");
+
 function renderScenarios(scenarios) {
   const root = document.getElementById("scenarios");
   if (!scenarios.length) {
@@ -643,9 +647,10 @@ function renderScenarios(scenarios) {
   }
   root.replaceChildren(
     ...scenarios.map((sc) => {
+      // A step that ran and failed outranks one that could not be set up.
       const safe = sc.steps.every((st) => st.blocked);
-      const notRun = sc.steps.some((st) => st.result.startsWith("NOT RUN"));
-      const verdict = safe ? status("good", "handled safely") : notRun ? status("warning", "NOT RUN") : status("critical", "NOT handled");
+      const failed = sc.steps.some((st) => !st.blocked && !isNotRun(st));
+      const verdict = safe ? status("good", "handled safely") : failed ? status("critical", "NOT handled") : status("warning", "NOT RUN");
       return h(
         "div",
         { class: "scenario" },
@@ -655,7 +660,7 @@ function renderScenarios(scenarios) {
           h(
             "div",
             { class: "step" },
-            h("span", { class: `icon ${st.blocked ? "good" : "critical"}`, "aria-hidden": "true" }),
+            h("span", { class: `icon ${st.blocked ? "good" : isNotRun(st) ? "warning" : "critical"}`, "aria-hidden": "true" }),
             h("span", null, st.action),
             h("span", { class: "result" }, `→ ${st.result}`),
           ),
