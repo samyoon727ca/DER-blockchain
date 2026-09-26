@@ -105,7 +105,8 @@ contract EnergyMarketplace is AccessControl, Pausable, ReentrancyGuard {
         l.pricePerKwh = newPricePerKwh;
     }
 
-    /// @notice Close a listing and return unsold credits. Allowed while paused so sellers can always exit.
+    /// @notice Close a listing and return unsold credits. Allowed while this marketplace is paused, so
+    ///         sellers can exit; like every credit transfer it reverts while EnergyToken itself is paused.
     function cancelListing(uint256 listingId) external nonReentrant {
         Listing storage l = _activeListing(listingId);
         if (l.seller != msg.sender) revert NotSeller(listingId);
