@@ -17,8 +17,16 @@ const usd = (units, digits = 2) => {
   return v > 0 && v < 0.01 ? "<$0.01" : `$${v.toFixed(digits)}`;
 };
 const perKwh = (units) => `$${(Number(units) / 1e6).toFixed(3)}`;
-const hhmm = (ts) => new Date(Number(ts) * 1000).toISOString().slice(11, 16);
-const span = (t0) => `${hhmm(t0)}–${hhmm(Number(t0) + INTERVAL) === "00:00" ? "24:00" : hhmm(Number(t0) + INTERVAL)}`;
+// Timestamps can come from untrusted oracle submissions, so out-of-range values render as a dash.
+const hhmm = (ts) => {
+  const d = new Date(Number(ts) * 1000);
+  return Number.isFinite(d.getTime()) ? d.toISOString().slice(11, 16) : "–";
+};
+const span = (t0) => {
+  const from = hhmm(t0);
+  const to = hhmm(Number(t0) + INTERVAL);
+  return from === "–" ? "–" : `${from}–${to === "00:00" ? "24:00" : to}`;
+};
 const shortAddr = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 
 function h(tag, props, ...children) {
@@ -108,6 +116,7 @@ function niceMax(v) {
 
 const state = {
   nextBlock: 0,
+  lastHash: null, // hash of block nextBlock - 1, to notice when a restarted demo replaced the chain
   intervals: new Map(), // intervalStart -> { exp, imp } (Wh)
   lastReading: new Map(), // participant id -> reading
   minted: 0n,
@@ -142,16 +151,32 @@ async function main() {
   });
 
   async function blockTime(n) {
-    if (!state.blockTimes.has(n)) state.blockTimes.set(n, provider.getBlock(n).then((b) => b.timestamp));
+    if (!state.blockTimes.has(n)) {
+      // Forget failures, so one dropped request is retried instead of failing every later refresh.
+      const pending = provider.getBlock(n).then((b) => b.timestamp);
+      pending.catch(() => state.blockTimes.delete(n));
+      state.blockTimes.set(n, pending);
+    }
     return state.blockTimes.get(n);
   }
 
+  /** Apply events up to the latest block; returns the block number everything is now synced to. */
   async function syncEvents() {
     const latest = await provider.getBlockNumber();
-    if (latest < state.nextBlock) return;
+    if (state.nextBlock > 0) {
+      // A restarted demo starts a new chain from block 0 with the same contract addresses. If
+      // the last block synced is gone or different, nothing derived from it is valid: start over.
+      const last = await provider.getBlock(state.nextBlock - 1);
+      if (!last || last.hash !== state.lastHash) {
+        location.reload();
+        return new Promise(() => {}); // the page is going away
+      }
+    }
+    if (latest < state.nextBlock) return state.nextBlock - 1;
     const from = state.nextBlock;
     const q = (c, name) => c.queryFilter(c.filters[name](), from, latest);
-    const [readings, minted, burned, created, repriced, cancelled, trades] = await Promise.all([
+    const [tip, readings, minted, burned, created, repriced, cancelled, trades] = await Promise.all([
+      provider.getBlock(latest),
       q(token, "ReadingSettled"),
       q(token, "CreditsMinted"),
       q(token, "CreditsBurned"),
@@ -222,18 +247,22 @@ async function main() {
       }
     }
     state.nextBlock = latest + 1;
+    state.lastHash = tip.hash;
+    return latest;
   }
 
   async function refresh() {
-    const [demo, oracle] = await Promise.all([
+    const [demo, oracle, synced] = await Promise.all([
       fetch("/api/demo").then((r) => r.json()),
       fetch("/api/oracle").then((r) => r.json()),
       syncEvents(),
     ]);
+    // Read balances at the block the events were synced to, so every column describes the same moment.
+    const at = { blockTag: synced };
     const [block, paused, balances] = await Promise.all([
-      provider.getBlock("latest"),
-      token.paused(),
-      Promise.all(people.map((p) => Promise.all([token.balanceOf(p.wallet), stable.balanceOf(p.wallet)]))),
+      provider.getBlock(synced),
+      token.paused(at),
+      Promise.all(people.map((p) => Promise.all([token.balanceOf(p.wallet, at), stable.balanceOf(p.wallet, at)]))),
     ]);
 
     renderHeader(demo, block, paused);
@@ -494,20 +523,28 @@ function oracleStatusNode(st, code) {
   return h("span", { class: "who" }, status("critical", "Rejected"), code ? h("span", { class: "sub" }, code) : null);
 }
 
+/** Status of a meter's most recent reading; labelled with its interval when that is not the settled one beside it. */
+function latestReadingNode(settled, latest) {
+  if (!latest) return "–";
+  if (latest.oracleStatus === "settled" || (settled && settled.intervalStart >= latest.intervalStart)) return oracleStatusNode("settled");
+  return h("span", { class: "who" }, oracleStatusNode(latest.oracleStatus), h("span", { class: "sub" }, span(latest.intervalStart)));
+}
+
 function renderMeters(people, demo) {
   const rows = people.map((p) => {
     const r = state.lastReading.get(p.id);
-    const live = demo.households[p.id];
+    // Behind-the-meter flows of the settled interval in this row, never of a newer, unsettled one.
+    const flows = r ? (demo.recentFlows[p.id] || {})[r.intervalStart] : undefined;
     return [
       who(p),
       r ? span(r.intervalStart) : "–",
-      live ? (live.pvWh / 250).toFixed(2) : "–",
-      live ? (live.loadWh / 250).toFixed(2) : "–",
-      p.batteryKwh ? (live ? `${live.batterySocKwh.toFixed(1)} / ${p.batteryKwh}` : "–") : "—",
+      flows ? (flows.pvWh / 250).toFixed(2) : "–",
+      flows ? (flows.loadWh / 250).toFixed(2) : "–",
+      p.batteryKwh ? (flows ? `${flows.batterySocKwh.toFixed(1)} / ${p.batteryKwh}` : "–") : "—",
       r ? r.exportedWh.toLocaleString() : "–",
       r ? r.importedWh.toLocaleString() : "–",
       r ? String(r.nonce) : "–",
-      live ? oracleStatusNode(live.oracleStatus) : "–",
+      latestReadingNode(r, demo.households[p.id]),
     ];
   });
   setTable(
@@ -607,10 +644,12 @@ function renderScenarios(scenarios) {
   root.replaceChildren(
     ...scenarios.map((sc) => {
       const safe = sc.steps.every((st) => st.blocked);
+      const notRun = sc.steps.some((st) => st.result.startsWith("NOT RUN"));
+      const verdict = safe ? status("good", "handled safely") : notRun ? status("warning", "NOT RUN") : status("critical", "NOT handled");
       return h(
         "div",
         { class: "scenario" },
-        h("h3", null, `${hhmm(sc.at)} · ${sc.title} `, safe ? status("good", "handled safely") : status("critical", "NOT handled")),
+        h("h3", null, `${hhmm(sc.at)} · ${sc.title} `, verdict),
         h("p", { class: "threat" }, sc.threat),
         ...sc.steps.map((st) =>
           h(
