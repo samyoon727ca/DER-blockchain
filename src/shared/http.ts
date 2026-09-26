@@ -14,6 +14,7 @@ export class BodyTooLarge extends Error {
  */
 export function readBody(req: http.IncomingMessage, maxBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
+    req.on("error", reject);
     if (Number(req.headers["content-length"]) > maxBytes) {
       req.resume();
       reject(new BodyTooLarge(maxBytes));
@@ -34,6 +35,5 @@ export function readBody(req: http.IncomingMessage, maxBytes: number): Promise<s
     req.on("end", () => {
       if (chunks) resolve(Buffer.concat(chunks).toString("utf8"));
     });
-    req.on("error", reject);
   });
 }

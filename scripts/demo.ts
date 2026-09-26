@@ -24,7 +24,7 @@ import { Oracle } from "../src/oracle/oracle";
 import { startOracleServer } from "../src/oracle/server";
 import { SCENARIOS, type Phase, type ScenarioContext, type ScenarioOutcome } from "../src/scenarios/security";
 import { buildSettlement, renderMarkdown, saveReport, telemetryPath } from "../src/settlement/report";
-import { REPORTS_DIR, connectContracts, rpcProvider, saveDeployment, DEPLOYMENT_FILE } from "../src/shared/chain";
+import { REPORTS_DIR, connectContracts, revertName, rpcProvider, saveDeployment, DEPLOYMENT_FILE } from "../src/shared/chain";
 import { deployMarketplace } from "../src/shared/deploy";
 import { ACCOUNT_INDEX, PARTICIPANTS, hardhatWallet } from "../src/shared/participants";
 import { INTERVALS_PER_DAY, INTERVAL_SECONDS, readingDomain, type SignedReading } from "../src/shared/reading";
@@ -220,19 +220,31 @@ async function main() {
       const waiting = oracle.log.filter((e) => e.status === "queued");
       await oracle.drain();
       const settled = waiting.filter((e) => e.status === "settled");
+      const refused = waiting.filter((e) => e.status === "rejected");
       for (const e of settled) {
         hour.minted += e.mintedWh ?? 0;
         hour.burned += e.burnedWh ?? 0;
       }
+      for (const e of refused) console.log(red(`  chain refused a queued reading from ${e.meter}: ${e.code} ${e.detail ?? ""}`));
       hour.ok += settled.length;
       hour.late += settled.length;
-      hour.queued = Math.max(0, hour.queued - settled.length);
+      hour.rejected += refused.length;
+      hour.queued = Math.max(0, hour.queued - settled.length - refused.length);
       return settled.length;
     },
   };
   const runScenarios = async (interval: number, phase: Phase, intervalStart: number) => {
     for (const hook of SCENARIOS.filter((s) => s.interval === interval && s.phase === phase)) {
-      recordScenario(await hook.run(scenarioCtx, intervalStart));
+      // A scenario that throws proves nothing: record it as a failure and carry on with the day.
+      const outcome = await hook.run(scenarioCtx, intervalStart).catch(
+        (err): ScenarioOutcome => ({
+          at: intervalStart,
+          title: `Scenario at ${hhmm(intervalStart)}`,
+          threat: "",
+          steps: [{ action: "Run the scenario", result: `NOT RUN: it failed with ${revertName(err)}`, blocked: false }],
+        }),
+      );
+      recordScenario(outcome);
     }
   };
 
@@ -335,10 +347,19 @@ async function main() {
   );
   console.log(`Report saved to ${demo.reportFile.replace(process.cwd() + "/", "")} (+ .json)\n`);
 
+  let shuttingDown = false;
   const shutdown = async (code: number) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    // An open dashboard tab keeps its keep-alive connections busy, so close() alone may never
+    // finish: drop those connections, and exit anyway if the chain's server lingers.
+    setTimeout(() => process.exit(code), 3000).unref();
     oracle.stop();
     provider.destroy();
-    await Promise.all([closeServer(oracleServer), closeServer(dashboard as http.Server), chain.close()]);
+    const servers: http.Server[] = [oracleServer, dashboard];
+    const closing = Promise.all([...servers.map(closeServer), chain.close()]);
+    for (const s of servers) s.closeAllConnections();
+    await closing.catch(() => undefined);
     process.exit(code);
   };
   const exitCode = checksOk && blocked ? 0 : 1;
