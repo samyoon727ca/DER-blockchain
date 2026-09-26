@@ -1,10 +1,11 @@
-import { Wallet, type BaseWallet, type JsonRpcProvider, type TypedDataDomain } from "ethers";
+import { Wallet, type BaseWallet, type Interface, type JsonRpcProvider, type TypedDataDomain } from "ethers";
 import type { OrderBook } from "../market/agents";
 import { sendToOracle, type OracleResponse } from "../meter-simulator/meter";
 import type { NeighbourhoodSimulator } from "../meter-simulator/simulator";
 import { revertName, type Contracts, type Deployment } from "../shared/chain";
-import { signReading, type SignedReading } from "../shared/reading";
-import { formatUsd, hhmm } from "../shared/units";
+import { PARTICIPANTS } from "../shared/participants";
+import { INTERVAL_SECONDS, signReading, type SignedReading } from "../shared/reading";
+import { formatUsd, hhmm, usdPerKwh } from "../shared/units";
 
 /**
  * Attacks and failure modes injected into the simulated day. Each one is
@@ -15,7 +16,7 @@ import { formatUsd, hhmm } from "../shared/units";
 export interface ScenarioStep {
   action: string;
   result: string;
-  blocked: boolean; // true = the system behaved safely
+  blocked: boolean; // true = the attack was attempted and the system behaved safely
 }
 
 export interface ScenarioOutcome {
@@ -51,13 +52,16 @@ export type Phase = "before-readings" | "after-readings";
 export interface ScenarioHook {
   interval: number; // 0..95
   phase: Phase;
-  run: (ctx: ScenarioContext, intervalStart: number) => Promise<ScenarioOutcome | null>;
+  run: (ctx: ScenarioContext, intervalStart: number) => Promise<ScenarioOutcome>;
 }
 
 const EXPECT = (res: OracleResponse, code: string): ScenarioStep["blocked"] => res.status === "rejected" && res.code === code;
 const describe = (res: OracleResponse) => (res.status === "rejected" ? `oracle rejected: ${res.code} (${res.detail})` : `oracle ${res.status}`);
 
-async function onchainAttempt(action: string, expected: string, call: () => Promise<unknown>, iface: Contracts["token"]["interface"]): Promise<ScenarioStep> {
+/** A step that could not be set up. It proves nothing, so it counts as a failure rather than a pass. */
+const notRun = (action: string, why: string): ScenarioStep => ({ action, result: `NOT RUN: ${why}`, blocked: false });
+
+async function onchainAttempt(action: string, expected: string, call: () => Promise<unknown>, iface: Interface): Promise<ScenarioStep> {
   try {
     await call();
     return { action, result: "call SUCCEEDED — this should not happen", blocked: false };
@@ -103,8 +107,10 @@ export const SCENARIOS: ScenarioHook[] = [
     interval: 38,
     phase: "after-readings",
     run: async (ctx, t) => {
+      const title = "Replay and double counting";
+      const threat = "A captured reading is re-sent, or the same interval is re-signed with a fresh nonce, to mint twice.";
       const settled = ctx.lastSettled.get("P2");
-      if (!settled) return null;
+      if (!settled) return { at: t, title, threat, steps: [notRun("Replay P2's last settled reading", "P2 has no settled reading yet")] };
       const replay = await sendToOracle(ctx.oracleUrl, settled);
       const resigned = await ctx.sim.meters.get("P2")!.sign({
         intervalStart: settled.reading.intervalStart,
@@ -114,8 +120,8 @@ export const SCENARIOS: ScenarioHook[] = [
       const again = await sendToOracle(ctx.oracleUrl, resigned);
       return {
         at: t,
-        title: "Replay and double counting",
-        threat: "A captured reading is re-sent, or the same interval is re-signed with a fresh nonce, to mint twice.",
+        title,
+        threat,
         steps: [
           { action: `Re-send P2's settled ${hhmm(settled.reading.intervalStart)} reading byte-for-byte`, result: describe(replay), blocked: EXPECT(replay, "DUPLICATE") },
           { action: `P2's meter re-signs the ${hhmm(settled.reading.intervalStart)} interval with a new nonce`, result: describe(again), blocked: EXPECT(again, "INTERVAL_ALREADY_SETTLED") },
@@ -168,16 +174,16 @@ export const SCENARIOS: ScenarioHook[] = [
           iface,
         ),
       ];
-      if (p3) {
-        steps.push(
-          await onchainAttempt(
-            `Stolen oracle key replays P3's settled ${hhmm(p3.reading.intervalStart)} reading`,
-            "IntervalAlreadySettled",
-            () => token.submitReading.staticCall(p3.reading, p3.signature),
-            iface,
-          ),
-        );
-      }
+      steps.push(
+        p3
+          ? await onchainAttempt(
+              `Stolen oracle key replays P3's settled ${hhmm(p3.reading.intervalStart)} reading`,
+              "IntervalAlreadySettled",
+              () => token.submitReading.staticCall(p3.reading, p3.signature),
+              iface,
+            )
+          : notRun("Stolen oracle key replays P3's last settled reading", "P3 has no settled reading yet"),
+      );
       steps.push(
         await onchainAttempt(
           "Stolen oracle key registers a fake meter it controls",
@@ -209,27 +215,57 @@ export const SCENARIOS: ScenarioHook[] = [
       await ctx.book.sync();
       const buyerId = "C3";
       const buyer = ctx.participants.get(buyerId)!;
-      const listing = ctx.book.listings().find((l) => l.remainingWh >= 200n);
+      const title = "Front-running";
       const threat = "A seller watches the mempool and raises the price before a pending buy is mined.";
-      if (!listing) {
-        return { at: t, title: "Front-running", threat, steps: [{ action: "No open listing to target", result: "skipped", blocked: true }] };
+      // The attacking seller has to be a household this demo controls; anyone else's listing is skipped.
+      const sellerOf = (l: { seller: string }) => [...ctx.participants.entries()].find(([, p]) => p.wallet.address === l.seller);
+      let listing = ctx.book.listings().find((l) => l.remainingWh >= 200n && sellerOf(l));
+      let seller = listing && sellerOf(listing);
+      const setup: ScenarioStep[] = [];
+
+      if (!listing || !seller) {
+        // Nothing suitable on the book (e.g. on a winter day every listing sells at once), so
+        // the prosumer holding the most unlisted credits lists some for the attack to target.
+        const balances = await Promise.all(
+          PARTICIPANTS.filter((p) => p.role === "prosumer").map(async (p) => {
+            const who = ctx.participants.get(p.id)!;
+            return { spec: p, who, balance: await who.contracts.token.balanceOf(who.wallet.address) };
+          }),
+        );
+        const richest = balances.sort((a, b) => (b.balance > a.balance ? 1 : b.balance < a.balance ? -1 : 0))[0];
+        if (!richest || richest.balance < 200n) {
+          return { at: t, title, threat, steps: [notRun("Find a listing to front-run", "no open listing and no prosumer holds 200 Wh of credits")] };
+        }
+        const amount = richest.balance < 500n ? richest.balance : 500n;
+        const price = usdPerKwh(richest.spec.askUsdPerKwh!);
+        const receipt = (await (await richest.who.contracts.market.createListing(amount, price)).wait())!;
+        const created = receipt.logs.map((l) => richest.who.contracts.market.interface.parseLog(l)).find((e) => e?.name === "ListingCreated")!;
+        listing = { id: created.args.listingId as bigint, seller: richest.who.wallet.address, remainingWh: amount, pricePerKwh: price };
+        seller = [richest.spec.id, richest.who];
+        setup.push({
+          action: `No open listing to target, so ${richest.spec.id} lists ${Number(amount) / 1000} kWh at $${formatUsd(price, 3)}/kWh for the attack`,
+          result: `listing #${listing.id} created`,
+          blocked: true,
+        });
       }
-      const seller = [...ctx.participants.entries()].find(([, p]) => p.wallet.address === listing.seller)!;
-      const amountWh = listing.remainingWh < 500n ? listing.remainingWh : 500n;
+      const target = listing;
+      const amountWh = target.remainingWh < 500n ? target.remainingWh : 500n;
       const cashBefore = await buyer.contracts.stable.balanceOf(buyer.wallet.address);
       const gwei = 1_000_000_000n;
+
+      const sellerMarket = seller[1].contracts.market;
 
       // Hold mining so both transactions sit in the mempool together, as on a public chain.
       await ctx.provider.send("evm_setAutomine", [false]);
       let buyTx, repriceTx;
       try {
-        buyTx = await buyer.contracts.market.buy(listing.id, amountWh, listing.pricePerKwh, {
+        buyTx = await buyer.contracts.market.buy(target.id, amountWh, target.pricePerKwh, {
           gasLimit: 300_000,
           maxFeePerGas: 100n * gwei,
           maxPriorityFeePerGas: 1n * gwei,
         });
         // The seller sees the pending buy and outbids it with a higher tip.
-        repriceTx = await seller[1].contracts.market.updatePrice(listing.id, listing.pricePerKwh * 2n, {
+        repriceTx = await sellerMarket.updatePrice(target.id, target.pricePerKwh * 2n, {
           gasLimit: 100_000,
           maxFeePerGas: 100n * gwei,
           maxPriorityFeePerGas: 5n * gwei,
@@ -240,28 +276,35 @@ export const SCENARIOS: ScenarioHook[] = [
       }
       const repriceReceipt = await ctx.provider.getTransactionReceipt(repriceTx!.hash);
       const buyReceipt = await ctx.provider.getTransactionReceipt(buyTx!.hash);
+      const sameBlock = repriceReceipt !== null && repriceReceipt.blockNumber === buyReceipt?.blockNumber;
+      const orderedFirst = sameBlock && repriceReceipt.index < buyReceipt!.index;
+      // With both in one block and the re-price first, the state after the block is the
+      // state the buy executed against, so re-running it reproduces its revert reason.
       const reason = await buyer.contracts.market.buy
-        .staticCall(listing.id, amountWh, listing.pricePerKwh)
+        .staticCall(target.id, amountWh, target.pricePerKwh)
         .then(() => "none")
         .catch((err) => revertName(err, buyer.contracts.market.interface));
       const cashAfter = await buyer.contracts.stable.balanceOf(buyer.wallet.address);
-      const sameBlock = repriceReceipt?.blockNumber === buyReceipt?.blockNumber;
-      const orderedFirst = (repriceReceipt?.index ?? 99) < (buyReceipt?.index ?? 0);
+
+      // Put the market back as it was, so the attack does not distort the rest of the day.
+      if (setup.length > 0) await (await sellerMarket.cancelListing(target.id)).wait();
+      else await (await sellerMarket.updatePrice(target.id, target.pricePerKwh)).wait();
 
       return {
         at: t,
-        title: "Front-running",
+        title,
         threat,
         steps: [
+          ...setup,
           {
-            action: `${buyerId} submits buy of ${Number(amountWh) / 1000} kWh from listing #${listing.id} at $${formatUsd(listing.pricePerKwh, 3)}/kWh (tip 1 gwei)`,
+            action: `${buyerId} submits buy of ${Number(amountWh) / 1000} kWh from listing #${target.id} at $${formatUsd(target.pricePerKwh, 3)}/kWh (tip 1 gwei)`,
             result: "pending in mempool",
             blocked: true,
           },
           {
-            action: `${seller[0]} re-prices listing #${listing.id} to $${formatUsd(listing.pricePerKwh * 2n, 3)}/kWh with a 5 gwei tip`,
-            result: sameBlock && orderedFirst ? "mined first in the same block" : "mined",
-            blocked: true,
+            action: `${seller[0]} re-prices listing #${target.id} to $${formatUsd(target.pricePerKwh * 2n, 3)}/kWh with a 5 gwei tip`,
+            result: orderedFirst ? "mined first in the same block" : "NOT mined ahead of the buy in the same block, so the race was not set up",
+            blocked: orderedFirst,
           },
           {
             action: `${buyerId}'s buy executes after the price change`,
@@ -269,7 +312,7 @@ export const SCENARIOS: ScenarioHook[] = [
               buyReceipt?.status === 0
                 ? `reverted (${reason}); buyer paid $${formatUsd(cashBefore - cashAfter)} — maxPricePerKwh protected the order`
                 : "FILLED at the higher price — this should not happen",
-            blocked: buyReceipt?.status === 0 && cashAfter === cashBefore,
+            blocked: orderedFirst && buyReceipt?.status === 0 && reason === "PriceAboveLimit" && cashAfter === cashBefore,
           },
         ],
       };
@@ -282,11 +325,20 @@ export const SCENARIOS: ScenarioHook[] = [
     phase: "before-readings",
     run: async (ctx, t) => {
       await (await ctx.admin.token.pause()).wait();
+      const p1 = ctx.participants.get("P1")!.contracts.market;
       return {
         at: t,
         title: "Emergency pause",
         threat: "Operator halts minting, burning and transfers (e.g. while investigating an incident).",
-        steps: [{ action: "Admin (PAUSER_ROLE) pauses EnergyToken", result: "paused: readings will queue at the oracle, trading halts", blocked: true }],
+        steps: [
+          { action: "Admin (PAUSER_ROLE) pauses EnergyToken", result: "paused: readings will queue at the oracle", blocked: true },
+          await onchainAttempt(
+            "P1 tries to list credits on the marketplace while the token is paused",
+            "EnforcedPause",
+            () => p1.createListing.staticCall(100n, usdPerKwh(0.14)),
+            p1.interface,
+          ),
+        ],
       };
     },
   },
@@ -295,15 +347,16 @@ export const SCENARIOS: ScenarioHook[] = [
     phase: "after-readings",
     run: async (ctx, t) => {
       const status = (await (await fetch(`${ctx.oracleUrl}/status`)).json()) as { stats: { queued: number } };
+      const meters = ctx.deployment.participants.length;
       return {
         at: t,
         title: "Emergency pause",
         threat: "",
         steps: [
           {
-            action: `Meters report the ${hhmm(t)}–${hhmm(t + 900)} interval while paused`,
-            result: `${status.stats.queued} readings held in the oracle's queue, none lost`,
-            blocked: status.stats.queued > 0,
+            action: `Meters report the ${hhmm(t)}–${hhmm(t + INTERVAL_SECONDS)} interval while paused`,
+            result: `${status.stats.queued} of ${meters} readings held in the oracle's queue`,
+            blocked: status.stats.queued === meters,
           },
         ],
       };
@@ -315,11 +368,20 @@ export const SCENARIOS: ScenarioHook[] = [
     run: async (ctx, t) => {
       await (await ctx.admin.token.unpause()).wait();
       const settled = await ctx.drainOracle();
+      const paused = t - INTERVAL_SECONDS;
+      const cursors = await Promise.all(ctx.deployment.participants.map((p) => ctx.admin.token.getMeter(p.meter)));
+      const caughtUp = cursors.filter((m) => Number(m.lastIntervalStart) === paused).length;
       return {
         at: t,
         title: "Emergency pause",
         threat: "",
-        steps: [{ action: "Admin unpauses EnergyToken", result: `oracle drained its queue: ${settled} readings settled in order`, blocked: settled > 0 }],
+        steps: [
+          {
+            action: "Admin unpauses EnergyToken",
+            result: `oracle drained its queue: ${settled} readings settled; ${caughtUp} of ${cursors.length} meters now settled through ${hhmm(paused)}`,
+            blocked: settled === cursors.length && caughtUp === cursors.length,
+          },
+        ],
       };
     },
   },

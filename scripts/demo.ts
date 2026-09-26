@@ -49,6 +49,8 @@ const red = color(31);
 const yellow = color(33);
 const cyan = color(36);
 
+const RECENT_INTERVALS = 8;
+
 interface HouseholdLive extends IntervalFlows {
   intervalStart: number;
   oracleStatus: string;
@@ -61,7 +63,10 @@ const demo = {
   dayStart: 0,
   intervalIndex: -1,
   intervalsTotal: INTERVALS_PER_DAY,
+  /** The latest reading each meter submitted, whatever the oracle did with it. */
   households: {} as Record<string, HouseholdLive>,
+  /** Behind-the-meter flows of each meter's last few intervals, so the dashboard can show those of the settled one. */
+  recentFlows: {} as Record<string, Record<number, IntervalFlows>>,
   scenarios: [] as ScenarioOutcome[],
   marketLog: [] as (MarketEvent & { at: number })[],
   reportFile: null as string | null,
@@ -121,13 +126,16 @@ function closeServer(server: { close(cb?: () => void): unknown } | undefined): P
 }
 
 async function main() {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(SIM_DATE)) throw new DemoError(`SIM_DATE must be YYYY-MM-DD, got "${SIM_DATE}"`);
+  // Date.parse rolls impossible dates over (2026-02-30 -> March 2), so round-trip to be sure.
+  const dayStart = Date.parse(`${SIM_DATE}T00:00:00Z`) / 1000;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(SIM_DATE) || !Number.isFinite(dayStart) || new Date(dayStart * 1000).toISOString().slice(0, 10) !== SIM_DATE) {
+    throw new DemoError(`SIM_DATE must be a real calendar date as YYYY-MM-DD, got "${SIM_DATE}"`);
+  }
   await assertPortsFree([
     ["RPC_PORT", RPC_PORT],
     ["ORACLE_PORT", ORACLE_PORT],
     ["DASHBOARD_PORT", DASHBOARD_PORT],
   ]);
-  const dayStart = Date.parse(`${SIM_DATE}T00:00:00Z`) / 1000;
   demo.dayStart = dayStart;
 
   console.log(bold("\nDistributed energy marketplace — proof of concept"));
@@ -152,6 +160,8 @@ async function main() {
     simDate: SIM_DATE,
   });
   saveDeployment(deployment);
+  // Telemetry from an earlier run of the same date would not match this chain; it is rewritten at the end of the day.
+  fs.rmSync(telemetryPath(SIM_DATE), { force: true });
   const domain = readingDomain(deployment.chainId, deployment.contracts.energyToken);
   const adminContracts = connectContracts(deployment, admin);
 
@@ -188,6 +198,10 @@ async function main() {
   });
   await Promise.all([...prosumers, ...consumers].map((a) => a.approve()));
 
+  // Totals for the hourly progress table.
+  const newHour = () => ({ exported: 0, imported: 0, minted: 0, burned: 0, listed: 0, trades: 0, tradedWh: 0n, spent: 0n, ok: 0, late: 0, queued: 0, rejected: 0 });
+  let hour = newHour();
+
   const lastSettled = new Map<string, SignedReading>();
   const scenarioCtx: ScenarioContext = {
     deployment,
@@ -202,22 +216,29 @@ async function main() {
     participants: new Map(PARTICIPANTS.map((p) => [p.id, { wallet: wallets.get(p.id)!, contracts: participantContracts.get(p.id)! }])),
     lastSettled,
     drainOracle: async () => {
-      const before = oracle.stats.settled;
+      // Readings held while the token was paused settle now: count them in this hour's row.
+      const waiting = oracle.log.filter((e) => e.status === "queued");
       await oracle.drain();
-      return oracle.stats.settled - before;
+      const settled = waiting.filter((e) => e.status === "settled");
+      for (const e of settled) {
+        hour.minted += e.mintedWh ?? 0;
+        hour.burned += e.burnedWh ?? 0;
+      }
+      hour.ok += settled.length;
+      hour.late += settled.length;
+      hour.queued = Math.max(0, hour.queued - settled.length);
+      return settled.length;
     },
   };
   const runScenarios = async (interval: number, phase: Phase, intervalStart: number) => {
     for (const hook of SCENARIOS.filter((s) => s.interval === interval && s.phase === phase)) {
-      const outcome = await hook.run(scenarioCtx, intervalStart);
-      if (outcome) recordScenario(outcome);
+      recordScenario(await hook.run(scenarioCtx, intervalStart));
     }
   };
 
   // 5. The simulated day ------------------------------------------------------------
   demo.phase = "running";
   console.log(dim("  Hour         Export   Import   Minted   Burned   Listings   Trades                  Oracle"));
-  let hour = { exported: 0, imported: 0, minted: 0, burned: 0, listed: 0, trades: 0, tradedWh: 0n, spent: 0n, ok: 0, queued: 0, rejected: 0 };
 
   for (let i = 0; i < INTERVALS_PER_DAY; i++) {
     const intervalStart = sim.intervalStart(i);
@@ -231,8 +252,14 @@ async function main() {
 
     await runScenarios(i, "before-readings", intervalStart);
 
-    // Meters sign their readings and send them to the oracle concurrently.
+    // Meters sign their readings and send them to the oracle concurrently. Their telemetry is
+    // published first, so the dashboard has it by the time any of these readings settles.
     const outputs = await sim.readInterval(i);
+    for (const o of outputs) {
+      const recent = (demo.recentFlows[o.participant.id] ??= {});
+      recent[intervalStart] = o.flows;
+      delete recent[intervalStart - RECENT_INTERVALS * INTERVAL_SECONDS];
+    }
     const responses = await Promise.all(outputs.map((o) => sendToOracle(oracleUrl, o.signed)));
     outputs.forEach((o, k) => {
       const res = responses[k];
@@ -275,13 +302,17 @@ async function main() {
     if (i % 4 === 3) {
       const h = hhmm(intervalEnd - 3600);
       const trades = `${hour.trades} (${formatKwh(hour.tradedWh, 1)} kWh, $${formatUsd(hour.spent)})`;
-      const oracleCol = `${hour.ok} settled` + (hour.queued ? yellow(`, ${hour.queued} queued`) : "") + (hour.rejected ? red(`, ${hour.rejected} rejected`) : "");
+      const oracleCol =
+        `${hour.ok} settled` +
+        (hour.late ? yellow(` (${hour.late} after queueing)`) : "") +
+        (hour.queued ? yellow(`, ${hour.queued} queued`) : "") +
+        (hour.rejected ? red(`, ${hour.rejected} rejected`) : "");
       console.log(
         `  ${h}–${hhmm(intervalEnd) === "00:00" ? "24:00" : hhmm(intervalEnd)}  ` +
           [hour.exported, hour.imported, hour.minted, hour.burned].map((wh) => formatKwh(wh, 1).padStart(6)).join("   ") +
           `   ${String(hour.listed).padStart(8)}   ${trades.padEnd(22)}  ${oracleCol}`,
       );
-      hour = { exported: 0, imported: 0, minted: 0, burned: 0, listed: 0, trades: 0, tradedWh: 0n, spent: 0n, ok: 0, queued: 0, rejected: 0 };
+      hour = newHour();
     }
 
     if (INTERVAL_DELAY_MS > 0) await sleep(INTERVAL_DELAY_MS);
