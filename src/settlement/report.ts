@@ -2,8 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { ZeroAddress, type Provider } from "ethers";
 import { REPORTS_DIR, connectContracts, type Deployment } from "../shared/chain";
-import { TARIFFS } from "../shared/participants";
-import { readingDomain, recoverReadingSigner, type MeterReading } from "../shared/reading";
+import { CONSUMER_STARTING_USD, TARIFFS } from "../shared/participants";
+import { readingDomain, recoverReadingSigner, type DecodedReading } from "../shared/reading";
 import { USD, hhmm } from "../shared/units";
 
 /**
@@ -157,12 +157,16 @@ export async function buildSettlement(
 
   // Re-verify every settled reading instead of trusting the contract's events:
   // decode the submitReading call that produced it, recover the meter's own
-  // EIP-712 signature, and check the call matches the event, the credits went
-  // to the meter's registered owner and exactly the signed export was minted.
+  // EIP-712 signature, check the call matches the event, and check the ERC-20
+  // mints in that transaction: exactly the signed export, all to the meter's
+  // registered owner.
   const domain = readingDomain(deployment.chainId, deployment.contracts.energyToken);
   const ownerOf = new Map(registered.map((ev) => [ev.args.meter, ev.args.owner]));
-  const mintedInTx = new Map<string, bigint>();
-  for (const ev of minted) mintedInTx.set(ev.transactionHash, (mintedInTx.get(ev.transactionHash) ?? 0n) + ev.args.amountWh);
+  const mintTransfers = transfers.filter((ev) => ev.args.from === ZeroAddress);
+  const mintsInTx = new Map<string, { to: string; value: bigint }[]>();
+  for (const ev of mintTransfers) {
+    mintsInTx.set(ev.transactionHash, [...(mintsInTx.get(ev.transactionHash) ?? []), { to: ev.args.to, value: ev.args.value }]);
+  }
   const txs = await Promise.all(readings.map((ev) => provider.getTransaction(ev.transactionHash)));
   const verifiedTxs = new Set<string>();
   readings.forEach((ev, i) => {
@@ -170,30 +174,31 @@ export async function buildSettlement(
     if (!tx || tx.to?.toLowerCase() !== deployment.contracts.energyToken.toLowerCase()) return;
     const call = token.interface.parseTransaction({ data: tx.data });
     if (call?.name !== "submitReading") return;
-    const [r, signature] = call.args as unknown as [Record<keyof MeterReading, string | bigint>, string];
-    const reading: MeterReading = {
-      meter: String(r.meter),
-      intervalStart: Number(r.intervalStart),
-      exportedWh: Number(r.exportedWh),
-      importedWh: Number(r.importedWh),
-      nonce: Number(r.nonce),
+    const [r, signature] = call.args as unknown as [DecodedReading, string];
+    const reading: DecodedReading = {
+      meter: r.meter,
+      intervalStart: r.intervalStart,
+      exportedWh: r.exportedWh,
+      importedWh: r.importedWh,
+      nonce: r.nonce,
     };
-    const matchesEvent =
-      reading.meter === ev.args.meter &&
-      BigInt(reading.intervalStart) === ev.args.intervalStart &&
-      BigInt(reading.exportedWh) === ev.args.exportedWh &&
-      BigInt(reading.importedWh) === ev.args.importedWh &&
-      BigInt(reading.nonce) === ev.args.nonce;
+    const owner = ownerOf.get(reading.meter);
+    const mints = mintsInTx.get(ev.transactionHash) ?? [];
     if (
-      matchesEvent &&
+      reading.meter === ev.args.meter &&
+      reading.intervalStart === ev.args.intervalStart &&
+      reading.exportedWh === ev.args.exportedWh &&
+      reading.importedWh === ev.args.importedWh &&
+      reading.nonce === ev.args.nonce &&
       recoverReadingSigner(domain, reading, signature) === reading.meter &&
-      ownerOf.get(reading.meter) === ev.args.owner &&
-      (mintedInTx.get(ev.transactionHash) ?? 0n) === ev.args.exportedWh
+      owner === ev.args.owner &&
+      mints.every((m) => m.to === owner) &&
+      mints.reduce((sum, m) => sum + m.value, 0n) === reading.exportedWh
     ) {
       verifiedTxs.add(ev.transactionHash);
     }
   });
-  const untracedMints = minted.filter((ev) => !verifiedTxs.has(ev.transactionHash)).length;
+  const untracedMints = mintTransfers.filter((ev) => !verifiedTxs.has(ev.transactionHash)).length;
 
   const participants: ParticipantSettlement[] = [];
   let walletCreditsTotal = 0n;
@@ -205,8 +210,10 @@ export async function buildSettlement(
     const [walletCredits, stableBalance] = await Promise.all([token.balanceOf(p.wallet, at), stable.balanceOf(p.wallet, at)]);
     walletCreditsTotal += walletCredits;
     stableTotal += stableBalance;
-    // After deployment funding, mUSD may only move through marketplace trades.
-    const funded = BigInt(p.startingUsd) * USD;
+    // After deployment funding, mUSD may only move through marketplace trades. (Deployment
+    // files written before funding was recorded used the same policy: consumers only.)
+    const startingUsd = p.startingUsd ?? (p.role === "consumer" ? CONSUMER_STARTING_USD : 0);
+    const funded = BigInt(startingUsd) * USD;
     fundedTotal += funded;
     if (stableBalance !== funded + a.revenue - a.spent) unreconciledBalances++;
     const t = telemetry?.[p.id];
@@ -232,8 +239,10 @@ export async function buildSettlement(
       creditsInOpenListingsKwh: kwh(a.escrow),
       stablecoinUsd: usd(stableBalance),
       upliftVsFeedInUsd: usd(a.revenue) - kwh(a.sold) * TARIFFS.feedInUsdPerKwh,
+      // Credits received other than by buying (e.g. a plain transfer) cost nothing, so at most `spent` is charged.
       savingsVsGridUsd:
-        kwh(a.burned) * TARIFFS.gridRetailUsdPerKwh - (a.bought > 0n ? (usd(a.spent) * Number(a.burned)) / Number(a.bought) : 0),
+        kwh(a.burned) * TARIFFS.gridRetailUsdPerKwh -
+        (a.bought > 0n ? usd(a.spent) * Math.min(1, Number(a.burned) / Number(a.bought)) : 0),
     });
   }
 

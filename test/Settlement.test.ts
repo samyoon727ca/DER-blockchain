@@ -6,7 +6,7 @@ import { buildSettlement } from "../src/settlement/report";
 import { connectContracts } from "../src/shared/chain";
 import { deployMarketplace } from "../src/shared/deploy";
 import { PARTICIPANTS, meterKey } from "../src/shared/participants";
-import { INTERVAL_SECONDS, readingDomain } from "../src/shared/reading";
+import { INTERVAL_SECONDS, READING_TYPES, readingDomain } from "../src/shared/reading";
 import { USD, usdPerKwh } from "../src/shared/units";
 import { advanceIntervals, lastFinishedInterval } from "./helpers";
 
@@ -48,7 +48,7 @@ describe("Settlement report", () => {
     return { deployment, admin, prosumerWallet, consumerWallet };
   }
 
-  it("passes every integrity check for a consistent history, read at a single block", async () => {
+  it("passes every integrity check for a consistent history", async () => {
     const { deployment } = await loadFixture(tradedFixture);
     const report = await buildSettlement(deployment, ethers.provider);
     expect(report.checks.filter((c) => !c.ok)).to.deep.equal([]);
@@ -58,6 +58,57 @@ describe("Settlement report", () => {
     expect(c1).to.include({ boughtKwh: 0.6, spentUsd: 0.072, creditsBurnedKwh: 0.6, gridSuppliedKwh: 0.2 });
     // 0.6 kWh of imports covered by credits: $0.18 at grid retail, for which C1 paid $0.072.
     expect(c1.savingsVsGridUsd).to.be.closeTo(0.108, 1e-9);
+  });
+
+  it("reads everything at one block, even while more readings settle during the report", async () => {
+    const { deployment } = await loadFixture(tradedFixture);
+    const [, oracleSigner] = await ethers.getSigners();
+    const domain = readingDomain(deployment.chainId, deployment.contracts.energyToken);
+    const settleAnotherExport = async () => {
+      const reading = { meter: meterKey("P2").address, intervalStart: BigInt(await lastFinishedInterval()), exportedWh: 500n, importedWh: 0n, nonce: 2n };
+      const signature = await meterKey("P2").signTypedData(domain, READING_TYPES, reading);
+      await (await connectContracts(deployment, oracleSigner).token.submitReading(reading, signature)).wait();
+    };
+    // Once the report has read events and starts reading balances, another reading settles,
+    // as happens when `npm run report` runs while the demo is still going.
+    let raced = false;
+    const racing = new Proxy(ethers.provider, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop, target);
+        if (typeof value !== "function") return value;
+        if (prop !== "call") return value.bind(target);
+        return async (...args: unknown[]) => {
+          if (!raced) {
+            raced = true;
+            await settleAnotherExport();
+          }
+          return value.apply(target, args);
+        };
+      },
+    });
+    const report = await buildSettlement(deployment, racing);
+    expect(raced).to.equal(true);
+    expect(report.totals.mintedKwh).to.equal(1);
+    expect(report.checks.filter((c) => !c.ok)).to.deep.equal([]);
+  });
+
+  it("re-verifies readings exactly, including nonces beyond JavaScript's safe integers", async () => {
+    const { deployment } = await loadFixture(tradedFixture);
+    const [, oracleSigner] = await ethers.getSigners();
+    await advanceIntervals(1);
+    // A meter-signed reading submitted straight to the contract (the oracle itself refuses such nonces).
+    const reading = {
+      meter: meterKey("P2").address,
+      intervalStart: BigInt(await lastFinishedInterval()),
+      exportedWh: 10n,
+      importedWh: 0n,
+      nonce: 2n ** 60n + 1n,
+    };
+    const domain = readingDomain(deployment.chainId, deployment.contracts.energyToken);
+    const signature = await meterKey("P2").signTypedData(domain, READING_TYPES, reading);
+    await connectContracts(deployment, oracleSigner).token.submitReading(reading, signature);
+    const report = await buildSettlement(deployment, ethers.provider);
+    expect(report.checks.find((c) => c.name === "Every credit traces to a signed meter reading")).to.include({ ok: true });
   });
 
   it("re-verifies each reading's meter signature from calldata rather than trusting events", async () => {

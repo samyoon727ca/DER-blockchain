@@ -9,6 +9,9 @@ export interface MeterReading {
   nonce: number; // strictly increasing per meter
 }
 
+/** A reading as decoded from calldata or events: uint fields as bigint, so uint64 values stay exact. */
+export type DecodedReading = { [K in keyof MeterReading]: K extends "meter" ? string : bigint };
+
 export interface SignedReading {
   reading: MeterReading;
   signature: string;
@@ -55,7 +58,11 @@ export function isCanonicalSignature(signature: string): boolean {
  * Address that produced `signature` over `reading`, or null if the signature is
  * malformed or not in the canonical form EnergyToken accepts.
  */
-export function recoverReadingSigner(domain: TypedDataDomain, reading: MeterReading, signature: string): string | null {
+export function recoverReadingSigner(
+  domain: TypedDataDomain,
+  reading: MeterReading | DecodedReading,
+  signature: string,
+): string | null {
   if (!isCanonicalSignature(signature)) return null;
   try {
     return verifyTypedData(domain, READING_TYPES, reading, signature);
