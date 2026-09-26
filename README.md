@@ -273,7 +273,7 @@ Integrity checks (all pass): every credit traces to a signed reading (each readi
 - meter readings: latest settled interval per meter, with PV, load and battery state for that interval, and the status of each meter's most recent reading
 - balances: credits in wallet and in escrow, stablecoin, sold or bought kWh, earned or spent
 - open listings and trade history
-- security scenario outcomes and the oracle feed, with every rejected reading pinned
+- security scenario outcomes and the oracle feed, with the latest 100 rejected readings pinned
 
 The browser talks to the chain through a proxy that only forwards read-only JSON-RPC methods (requests over 64 KB get a 413). If the demo is restarted with the page open, the page notices the new chain and reloads itself.
 
@@ -315,7 +315,7 @@ The full analysis, with code pointers and residual risks, is in **[docs/THREAT_M
 - **Single oracle.** It cannot mint on its own, but it can withhold or delay readings. The retry queue is in memory and is lost if the process dies.
 - **Burn timing.** The consumption burn uses the owner's balance when a reading settles, not when the energy was used. A reading that settles late (an offline meter, a paused token, a slow or malicious oracle) also burns credits bought in the meantime.
 - **Local chain RPC.** The in-process Hardhat node on `127.0.0.1:8545` is unauthenticated, accepts cross-origin requests and holds unlocked accounts, including the admin. While the demo runs, any local process, or a web page the browser lets reach localhost, can send transactions to it. The dashboard's read-only proxy protects only the dashboard's own endpoint.
-- **Meter trust.** A meter whose key is extracted can report any value up to its rated capacity; the only plausibility check is that cap (no irradiance model, no comparison with neighbours).
+- **Meter trust.** A meter whose key is extracted can report any value up to its rated capacity; the only plausibility check is that cap (no irradiance model, no comparison with neighbours). The 6-hour age limit is enforced only by the oracle, so with the oracle key as well such a meter could backfill every interval since its last settled one.
 - **Privacy.** Every 15-minute reading is public on-chain, which reveals household routines.
 - **Market design.** A first-come order book with no time matching (noon solar can cover evening use), no grid constraints and no network fees. Credits never expire. Dust listings can linger until withdrawn.
 - **Admin key.** A single externally owned account holds admin, registrar and pauser roles. No multisig, timelock or upgrade path.

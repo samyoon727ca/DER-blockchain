@@ -66,6 +66,7 @@ The key design decision is **defence in depth at trust boundary 2**: `EnergyToke
 **Residual risk / deferred.**
 - **Censorship and delay.** A single oracle can drop or hold readings (liveness). Readings are also only accepted in order, so dropping one reading does not block later ones (nonce gaps are allowed) but its energy is never credited.
 - **Selective submission.** It could favour some meters over others.
+- **Backfilling with a stolen meter key.** Reading age is checked only by the oracle (`STALE_READING`); the contract accepts any finished interval newer than the meter's last settled one. With both the oracle key and a meter's key, an attacker can settle a reading for every interval since that meter's last one (for a meter that has never reported, back to 1970), each up to its rated capacity. Production: an on-chain registration floor and maximum reading age.
 - **Revoking the oracle drops its queue.** Readings it still holds are refused on-chain once its role is revoked, and are dropped (the oracle forgets them, so they could be re-sent); the demo's meters do not re-send, so a replacement oracle only settles readings from then on.
 - **Burn timing.** The consumption burn uses the owner's balance when the reading settles. By holding an import reading back (up to the 6-hour window the oracle accepts, and on-chain without limit), an oracle makes it burn credits the household bought after the consumption.
 - Production: several independent oracle operators with a k-of-n threshold (or a decentralised oracle network), meters able to submit directly as a fallback, public monitoring that compares meter-published hashes with settled readings, and a dispute window.
@@ -105,7 +106,7 @@ The key design decision is **defence in depth at trust boundary 2**: `EnergyToke
 
 **PoC mitigations.** Export is capped at the registered PV nameplate for 15 minutes and import at the service connection limit, both off-chain (`EXPORT_ABOVE_CAPACITY`, `IMPORT_ABOVE_CAPACITY`) and on-chain (`ExportAboveCapacity`, `ImportAboveCapacity`). The registrar can suspend a meter (`setMeterActive`). Demo scenario at 10:00 ("Implausible production").
 
-**Residual risk / deferred.** Inflation *below* the cap is not detected. Production: compare against irradiance data and neighbouring systems, flag export at night for systems without storage, reconcile with the utility's revenue-grade meter data (VEE: validation, estimation, editing), and anomaly detection.
+**Residual risk / deferred.** Inflation *below* the cap is not detected, and a tampered meter whose readings reach the chain through a compromised oracle can also backfill past intervals (see T2). Production: compare against irradiance data and neighbouring systems, flag export at night for systems without storage, reconcile with the utility's revenue-grade meter data (VEE: validation, estimation, editing), and anomaly detection.
 
 ### T6. Compromised admin / registrar
 
