@@ -1,7 +1,7 @@
-import type { Provider, TypedDataDomain } from "ethers";
+import type { Provider, TransactionReceipt, TypedDataDomain } from "ethers";
 import type { EnergyToken } from "../../typechain-types";
 import { isRevert, revertName } from "../shared/chain";
-import type { SignedReading } from "../shared/reading";
+import { INTERVAL_SECONDS, type SignedReading } from "../shared/reading";
 import {
   parseSignedReading,
   validateReading,
@@ -32,7 +32,10 @@ export interface OracleLogEntry extends OracleResult {
 
 interface QueuedReading {
   signed: SignedReading;
+  digest: string;
   log: OracleLogEntry;
+  /** Last transaction sent for this reading, so a send whose confirmation was lost can be reconciled. */
+  txHash?: string;
 }
 
 export interface OracleOptions {
@@ -55,7 +58,8 @@ export class Oracle {
   /** Rejections are rare and interesting, so they are kept separately from the rolling log. */
   readonly rejections: OracleLogEntry[] = [];
   private readonly cursors = new Map<string, MeterCursor>();
-  private readonly seenDigests = new Set<string>();
+  /** Digest -> interval end of each accepted reading, kept only while a replay of it would not be stale. */
+  private readonly seenDigests = new Map<string, number>();
   private readonly queue: QueuedReading[] = [];
   private draining: Promise<void> = Promise.resolve();
   private retryTimer?: NodeJS.Timeout;
@@ -108,6 +112,9 @@ export class Oracle {
     };
 
     const meter = await this.lookupMeter(reading.meter);
+    // No awaits from here until the reading is recorded as accepted, so two concurrent
+    // copies of the same reading cannot both pass validation.
+    this.pruneDigests(nowSeconds);
     const verdict = validateReading(parsed, {
       domain: this.domain,
       nowSeconds,
@@ -119,9 +126,9 @@ export class Oracle {
     if (!verdict.ok) return this.record({ ...entry, status: "rejected", code: verdict.code, detail: verdict.detail });
 
     // Accepted: advance the cursor now so later readings are checked against it.
-    this.seenDigests.add(verdict.digest);
+    this.seenDigests.set(verdict.digest, reading.intervalStart + INTERVAL_SECONDS);
     this.cursors.set(reading.meter, { lastNonce: reading.nonce, lastIntervalStart: reading.intervalStart });
-    const item: QueuedReading = { signed: parsed, log: entry };
+    const item: QueuedReading = { signed: parsed, digest: verdict.digest, log: entry };
     this.queue.push(item);
     this.record(entry);
 
@@ -141,8 +148,10 @@ export class Oracle {
     while (this.queue.length > 0) {
       const item = this.queue[0];
       try {
-        const tx = await this.token.submitReading(item.signed.reading, item.signed.signature);
-        const receipt = (await tx.wait())!;
+        // An earlier attempt may have been mined even though its confirmation was lost;
+        // resubmitting it would revert and wrongly report a credited reading as rejected.
+        const earlier = item.txHash ? await this.provider.getTransactionReceipt(item.txHash) : null;
+        const receipt = earlier?.status === 1 ? earlier : await this.submit(item);
         let mintedWh = 0;
         let burnedWh = 0;
         for (const log of receipt.logs) {
@@ -158,8 +167,35 @@ export class Oracle {
         if (!isRevert(err)) return; // transient RPC failure: retry later
         // The contract disagreed with the oracle (e.g. state changed since validation). Drop it.
         this.queue.shift();
+        this.forget(item);
         this.transition(item.log, { status: "rejected", code: "ONCHAIN_REVERT", detail: reason });
       }
+    }
+  }
+
+  private async submit(item: QueuedReading): Promise<TransactionReceipt> {
+    const tx = await this.token.submitReading(item.signed.reading, item.signed.signature);
+    item.txHash = tx.hash;
+    return (await tx.wait())!;
+  }
+
+  /**
+   * Undo the acceptance of a reading the chain refused, so a correct copy of it
+   * (or a re-signed one) can still settle. The meter's cursor falls back to its
+   * latest reading still queued, or else to the chain's.
+   */
+  private forget(item: QueuedReading): void {
+    this.seenDigests.delete(item.digest);
+    const meter = item.signed.reading.meter;
+    const pending = this.queue.filter((q) => q.signed.reading.meter === meter).at(-1)?.signed.reading;
+    if (pending) this.cursors.set(meter, { lastNonce: pending.nonce, lastIntervalStart: pending.intervalStart });
+    else this.cursors.delete(meter);
+  }
+
+  /** Drop digests of readings a replay of which would be rejected as stale anyway. */
+  private pruneDigests(nowSeconds: number): void {
+    for (const [digest, intervalEnd] of this.seenDigests) {
+      if (nowSeconds - intervalEnd > this.maxReadingAgeSeconds) this.seenDigests.delete(digest);
     }
   }
 
