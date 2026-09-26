@@ -59,8 +59,12 @@ function bump(hour: number, centre: number, width: number): number {
   return Math.exp(-0.5 * ((hour - centre) / width) ** 2);
 }
 
-/** Expected (noise-free) household demand in kW at a given hour; agents use it to plan purchases. */
-export function expectedLoadKw(spec: ParticipantSpec, hour: number): number {
+/** Random appliance use (kettle, oven, dryer...): in waking hours, sometimes 1.5-2.5 kW extra for an interval. */
+const SPIKE = { fromHour: 6, toHour: 23, probability: 0.05, minKw: 1.5, rangeKw: 1 };
+const inSpikeHours = (hour: number) => hour >= SPIKE.fromHour && hour < SPIKE.toHour;
+
+/** Household demand in kW at a given hour, without random appliance spikes. */
+function scheduledLoadKw(spec: ParticipantSpec, hour: number): number {
   const l = spec.load;
   let kw =
     l.baseKw +
@@ -69,6 +73,12 @@ export function expectedLoadKw(spec: ParticipantSpec, hour: number): number {
     l.eveningKw * bump(hour, 19.5, 1.6);
   if (spec.ev && hour >= spec.ev.startHour && hour < spec.ev.endHour) kw += spec.ev.kw;
   return kw;
+}
+
+/** Expected (mean) household demand in kW at a given hour, including appliance spikes; agents use it to plan purchases. */
+export function expectedLoadKw(spec: ParticipantSpec, hour: number): number {
+  const meanSpikeKw = inSpikeHours(hour) ? SPIKE.probability * (SPIKE.minKw + SPIKE.rangeKw / 2) : 0;
+  return scheduledLoadKw(spec, hour) + meanSpikeKw;
 }
 
 export interface IntervalFlows {
@@ -100,8 +110,8 @@ export class Household {
     const siteClearness = clamp(clearness * (1 + 0.04 * normal(rng)), 0, 1);
     const pvKwh = spec.pvKw * intervalPvFraction(this.latitudeDeg, this.doy, hour) * siteClearness * hours;
 
-    let loadKw = expectedLoadKw(spec, hour + 0.125) * (1 + 0.15 * normal(rng));
-    if (hour >= 6 && hour < 23 && rng() < 0.05) loadKw += 1.5 + rng(); // kettle, oven, dryer...
+    let loadKw = scheduledLoadKw(spec, hour + 0.125) * (1 + 0.15 * normal(rng));
+    if (inSpikeHours(hour) && rng() < SPIKE.probability) loadKw += SPIKE.minKw + SPIKE.rangeKw * rng();
     const loadKwh = Math.max(0.05, loadKw) * hours;
 
     let net = pvKwh - loadKwh; // + surplus, - deficit
